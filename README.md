@@ -1,6 +1,6 @@
 # osaurus-macos-use
 
-An Osaurus plugin for controlling macOS applications via accessibility APIs. Based on [mcp-server-macos-use](https://github.com/mediar-ai/mcp-server-macos-use).
+An Osaurus plugin for efficient macOS automation via accessibility APIs. Features decoupled actions/observations, element-based interactions, and smart filtering for minimal context usage.
 
 ## Prerequisites
 
@@ -10,102 +10,249 @@ An Osaurus plugin for controlling macOS applications via accessibility APIs. Bas
 
 Add the application using this plugin (e.g., Osaurus, or your terminal if running from CLI).
 
+## Architecture
+
+This plugin separates **actions** (click, type, press key) from **observations** (get UI elements), allowing agents to:
+
+1. Observe the UI once to understand the layout
+2. Execute multiple actions without re-observing
+3. Observe again only when needed (after navigation, dialogs, etc.)
+
+This dramatically reduces context usage compared to returning the full UI tree after every action.
+
 ## Tools
 
-### `open_application_and_traverse`
+### Core Action Tools (Lean responses ~100 tokens)
 
-Opens or activates a specified application and traverses its accessibility tree.
+#### `open_application`
 
-**Parameters:**
+Opens or activates an application by name, bundle ID, or path.
 
-- `identifier` (required): App name, bundle ID, or file path
-- `onlyVisibleElements` (optional): Filter to visible elements only
+```json
+{ "identifier": "Safari" }
+```
 
-**Example:**
+Returns: `{ "pid": 1234, "bundleId": "com.apple.Safari", "name": "Safari" }`
+
+#### `click_element`
+
+Clicks an element by its ID (from `get_ui_elements`). Uses AXPress action when available, falls back to coordinate click.
+
+```json
+{ "id": 5 }
+```
+
+#### `focus_element`
+
+Focuses an element by its ID. Useful for text fields before typing.
+
+```json
+{ "id": 3 }
+```
+
+#### `click`
+
+Clicks at raw screen coordinates. Use `click_element` instead when possible.
+
+```json
+{ "x": 100, "y": 200, "button": "left", "doubleClick": false }
+```
+
+#### `type_text`
+
+Types text into the currently focused element.
+
+```json
+{ "text": "Hello, world!" }
+```
+
+#### `press_key`
+
+Presses a keyboard key with optional modifiers.
+
+```json
+{ "key": "return", "modifiers": ["command"] }
+```
+
+#### `scroll`
+
+Scrolls in the specified direction.
+
+```json
+{ "direction": "down", "amount": 5 }
+```
+
+### Observation Tools (On-demand ~2-5K tokens)
+
+#### `get_ui_elements`
+
+Traverses the accessibility tree and returns interactive UI elements with assigned IDs.
 
 ```json
 {
-  "identifier": "Calculator"
+  "pid": 1234,
+  "maxElements": 100,
+  "maxDepth": 15,
+  "interactiveOnly": true
 }
 ```
 
-### `click_and_traverse`
-
-Simulates a mouse click at specific coordinates and traverses the accessibility tree.
-
-**Parameters:**
-
-- `pid` (required): Process ID of the target application
-- `x` (required): X-coordinate for the click
-- `y` (required): Y-coordinate for the click
-- `onlyVisibleElements` (optional): Filter to visible elements only
-
-**Example:**
+Returns compact element array:
 
 ```json
 {
-  "pid": 12345,
-  "x": 100.0,
-  "y": 200.0
+  "pid": 1234,
+  "app": "Safari",
+  "elementCount": 25,
+  "elements": [
+    {
+      "id": 1,
+      "role": "button",
+      "label": "Back",
+      "x": 50,
+      "y": 100,
+      "w": 30,
+      "h": 30,
+      "actions": ["press"]
+    },
+    {
+      "id": 2,
+      "role": "textfield",
+      "label": "Address",
+      "x": 100,
+      "y": 100,
+      "w": 400,
+      "h": 30,
+      "actions": ["focus"]
+    }
+  ]
 }
 ```
 
-### `type_and_traverse`
+#### `get_active_window`
 
-Simulates typing text into the target application and traverses the accessibility tree.
+Returns information about the currently active window.
 
-**Parameters:**
+```json
+{}
+```
 
-- `pid` (required): Process ID of the target application
-- `text` (required): The text to type
-- `onlyVisibleElements` (optional): Filter to visible elements only
+Returns: `{ "pid": 1234, "app": "Safari", "title": "Apple", "x": 0, "y": 25, "w": 1440, "h": 875 }`
 
-**Example:**
+#### `list_displays`
+
+Lists all connected displays with their positions and dimensions.
+
+```json
+{}
+```
+
+Returns:
 
 ```json
 {
-  "pid": 12345,
-  "text": "Hello, world!"
+  "displays": [
+    {
+      "index": 0,
+      "displayId": 1,
+      "x": 0,
+      "y": 0,
+      "width": 2560,
+      "height": 1440,
+      "isMain": true
+    },
+    {
+      "index": 1,
+      "displayId": 2,
+      "x": 2560,
+      "y": 0,
+      "width": 1920,
+      "height": 1080,
+      "isMain": false
+    }
+  ]
 }
 ```
 
-### `press_key_and_traverse`
+#### `take_screenshot`
 
-Simulates pressing a keyboard key with optional modifiers and traverses the accessibility tree.
-
-**Parameters:**
-
-- `pid` (required): Process ID of the target application
-- `keyName` (required): Key name (e.g., `Return`, `Escape`, `Tab`, `ArrowUp`, `a`, `B`)
-- `modifierFlags` (optional): Array of modifiers (`Shift`, `Command`, `Control`, `Option`, `Function`, `CapsLock`, `NumericPad`, `Help`)
-- `onlyVisibleElements` (optional): Filter to visible elements only
-
-**Example:**
+Captures a screenshot with multi-monitor support.
 
 ```json
-{
-  "pid": 12345,
-  "keyName": "Return",
-  "modifierFlags": ["Command"]
-}
+{ "displayIndex": 0 }           // Capture main display
+{ "displayIndex": 1 }           // Capture second display
+{ "allDisplays": true }         // Capture all displays as one image
+{ "pid": 1234 }                 // Capture specific window (works on any display)
+{ "scale": 0.5, "format": "jpeg", "quality": 0.8 }  // With compression
 ```
 
-### `refresh_traversal`
+### Convenience Tools (Action + Observation combined)
 
-Traverses the accessibility tree without performing any action. Useful for getting the current UI state.
+#### `click_element_and_observe`
 
-**Parameters:**
-
-- `pid` (required): Process ID of the application to traverse
-- `onlyVisibleElements` (optional): Filter to visible elements only
-
-**Example:**
+Clicks an element and returns the updated UI state.
 
 ```json
-{
-  "pid": 12345
-}
+{ "id": 5, "maxElements": 100, "interactiveOnly": true }
 ```
+
+#### `type_and_observe`
+
+Types text and returns the updated UI state.
+
+```json
+{ "text": "Hello", "pid": 1234 }
+```
+
+#### `press_key_and_observe`
+
+Presses a key and returns the updated UI state.
+
+```json
+{ "key": "return", "pid": 1234 }
+```
+
+## Typical Workflow
+
+```
+1. open_application({ "identifier": "Notes" })
+   → { "pid": 1234, "name": "Notes" }
+
+2. get_ui_elements({ "pid": 1234 })
+   → Returns 30 elements with IDs 1-30
+
+3. click_element({ "id": 5 })      // Click "New Note" button
+   → { "success": true }
+
+4. type_text({ "text": "My note content" })
+   → { "success": true }
+
+5. press_key({ "key": "s", "modifiers": ["command"] })  // Save
+   → { "success": true }
+```
+
+**Token usage: ~3K** vs **~150K** with the old approach (returning full tree after every action).
+
+## Element-Based Interactions
+
+Elements are identified by numeric IDs assigned during `get_ui_elements`. The plugin:
+
+1. **Tries AXPress action first** - Works regardless of mouse position, immune to user interference
+2. **Falls back to coordinate click** - Re-queries element position before clicking to minimize stale data
+
+This makes interactions more reliable than raw coordinate clicks.
+
+## Best Use Cases
+
+- **Native macOS apps** (Finder, Mail, Notes, System Settings) - Full AX action support
+- **Browser chrome** (tabs, bookmarks, toolbar) - Good AX support
+- **Well-built Electron apps** - Varies by implementation
+
+## Limitations
+
+- **Web content inside browsers** - Use Playwright for better reliability
+- **Canvas-based apps** (Figma, games) - Coordinate clicks only, no element tree
+- **Poorly accessible apps** - Falls back to coordinate-based interaction
 
 ## Development
 
@@ -134,41 +281,9 @@ codesign --force --options runtime --timestamp \
 ### Package and Distribute
 
 ```bash
-osaurus tools package osaurus.macos-use 0.1.0
+osaurus tools package osaurus.macos-use 0.2.0
 ```
 
-This creates `osaurus.macos-use-0.1.0.zip` for distribution.
+## License
 
-## Typical Workflow
-
-1. **Open an application** to get its PID and initial UI state:
-
-   ```json
-   { "identifier": "Notes" }
-   ```
-
-2. **Use the PID** from the response for subsequent actions:
-
-   ```json
-   { "pid": 12345, "x": 150, "y": 300 }
-   ```
-
-3. **Refresh the traversal** to see current UI state:
-   ```json
-   { "pid": 12345, "onlyVisibleElements": true }
-   ```
-
-## Response Format
-
-All tools return an `ActionResult` JSON object containing:
-
-- `openResult`: Application info (when using `open_application_and_traverse`)
-- `traversalPid`: The PID used for traversal
-- `traversalAfter`: The accessibility tree data with elements, coordinates, and attributes
-- `primaryActionError`: Any error from the action
-- `traversalAfterError`: Any error from the traversal
-
-## Credits
-
-- [MacosUseSDK](https://github.com/mediar-ai/MacosUseSDK) by mediar-ai
-- [mcp-server-macos-use](https://github.com/mediar-ai/mcp-server-macos-use) by mediar-ai
+MIT
