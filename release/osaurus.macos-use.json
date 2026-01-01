@@ -4,7 +4,9 @@
   "description": "Efficient macOS automation via accessibility APIs - element-based interactions, smart filtering, and decoupled actions/observations for minimal context usage",
   "homepage": "https://github.com/dinoki-ai/osaurus-macos-use",
   "license": "MIT",
-  "authors": ["dinoki-ai"],
+  "authors": [
+    "dinoki-ai"
+  ],
   "capabilities": {
     "tools": [
       {
@@ -70,18 +72,18 @@
   },
   "versions": [
     {
-      "version": "1.1.0",
+      "version": "1.1.1",
       "release_date": "2026-01-01",
       "artifacts": [
         {
           "os": "macos",
           "arch": "arm64",
           "min_macos": "13.0",
-          "url": "https://github.com/dinoki-ai/osaurus-macos-use/releases/download/1.1.0/osaurus.macos-use-1.1.0.zip",
-          "sha256": "82cc3e94343d94d4389e40508786469ebc25d4992ef3938a8a743b4ecd9ab567",
+          "url": "https://github.com/dinoki-ai/osaurus-macos-use/releases/download/1.1.1/osaurus.macos-use-1.1.1.zip",
+          "sha256": "98134a3ddba531404266d2bad359eab3e7d5d089179d7176c726fbae57c69b8f",
           "size": 128607,
           "minisign": {
-            "signature": "untrusted comment: signature from minisign secret key\nRWRh6pAWTUF1vyCoj3XoKPshvKSF3eLv3JotzIWu2yt4v/V6TKnJICOAhyw4vkTtTeotdZiHQgE1pO6ciU0RbC5kL0bXtNJ2XwI=\ntrusted comment: timestamp:1767307959\tfile:osaurus.macos-use-1.1.0.zip\nNidxZA1fgvgECqY+KPo0NOTEVSZRudIrQFUne6wvmrpkD+S+yxplYpBkxxt+HGX9k2xeX3SFoR+aQSX0y+4dAw=="
+            "signature": "untrusted comment: signature from minisign secret key\nRWRh6pAWTUF1v2rRlE5qp/QBB1sE1ODHSXRlFx32bbJhRpXJvfbv4h3wGd33cIKT7y+xgKp4eHbqU2C9B5zOYjB/wm2UKuAP8Qc=\ntrusted comment: timestamp:1767308297\tfile:osaurus.macos-use-1.1.1.zip\nMF2RtTx3H9sKZ3pN0p9U9evkk0Cz4Zzq2Lpn5CQ+/mBju4mw6aW66aFILptpf2VXYpE17up1WG4wIPMJEeisCA=="
           }
         }
       ]
