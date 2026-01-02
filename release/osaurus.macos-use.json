@@ -4,9 +4,7 @@
   "description": "Efficient macOS automation via accessibility APIs - element-based interactions, smart filtering, and decoupled actions/observations for minimal context usage",
   "homepage": "https://github.com/dinoki-ai/osaurus-macos-use",
   "license": "MIT",
-  "authors": [
-    "dinoki-ai"
-  ],
+  "authors": ["dinoki-ai"],
   "capabilities": {
     "tools": [
       {
@@ -51,7 +49,7 @@
       },
       {
         "name": "take_screenshot",
-        "description": "Captures a screenshot with multi-monitor support. Can capture main display, specific display by index, all displays combined, or a specific window."
+        "description": "Captures a screenshot with multi-monitor support. Can capture main display, specific display by index, all displays combined, or a specific window. Use savePath to save to file instead of returning base64 (avoids token limits). Defaults: format=jpeg, quality=0.7, scale=0.5."
       },
       {
         "name": "click_element_and_observe",

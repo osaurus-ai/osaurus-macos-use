@@ -176,15 +176,26 @@ Returns:
 
 #### `take_screenshot`
 
-Captures a screenshot with multi-monitor support.
+Captures a screenshot with multi-monitor support. Optimized defaults for minimal token usage.
+
+**Defaults:** `format=jpeg`, `quality=0.7`, `scale=0.5` (suitable for most use cases)
 
 ```json
 { "displayIndex": 0 }           // Capture main display
 { "displayIndex": 1 }           // Capture second display
 { "allDisplays": true }         // Capture all displays as one image
 { "pid": 1234 }                 // Capture specific window (works on any display)
-{ "scale": 0.5, "format": "jpeg", "quality": 0.8 }  // With compression
+{ "savePath": "/tmp/screen.jpg" }  // Save to file instead of base64 (avoids token limits)
+{ "scale": 1.0, "format": "png" }  // Full resolution PNG (larger output)
 ```
+
+**Save to file** - Use `savePath` to save the screenshot to disk instead of returning base64. This completely avoids token limit issues:
+
+```json
+{ "savePath": "/tmp/screenshot.jpg" }
+```
+
+Returns: `{ "success": true, "width": 1440, "height": 900, "path": "/tmp/screenshot.jpg" }`
 
 ### Convenience Tools (Action + Observation combined)
 
