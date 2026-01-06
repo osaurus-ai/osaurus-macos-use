@@ -2,29 +2,58 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-// MARK: - Screenshot Result
+// MARK: - Screenshot Result (MCP ImageContent format)
 
 struct ScreenshotResult: Encodable {
-  let success: Bool
+  /// MCP content type - "image" for image content
+  let type: String?
+  /// Base64-encoded image data (MCP ImageContent format uses "data" field)
+  let data: String?
+  /// MIME type of the image (e.g., "image/jpeg", "image/png")
+  let mimeType: String?
+  /// Image width in pixels
   let width: Int?
+  /// Image height in pixels
   let height: Int?
-  let base64: String?
+  /// File path when saved to disk instead of returning base64
   let path: String?
+  /// Error message if capture failed
   let error: String?
 
-  static func ok(width: Int, height: Int, base64: String) -> ScreenshotResult {
+  static func ok(width: Int, height: Int, data: String, mimeType: String) -> ScreenshotResult {
     return ScreenshotResult(
-      success: true, width: width, height: height, base64: base64, path: nil, error: nil)
+      type: "image",
+      data: data,
+      mimeType: mimeType,
+      width: width,
+      height: height,
+      path: nil,
+      error: nil
+    )
   }
 
   static func okWithPath(width: Int, height: Int, path: String) -> ScreenshotResult {
     return ScreenshotResult(
-      success: true, width: width, height: height, base64: nil, path: path, error: nil)
+      type: nil,
+      data: nil,
+      mimeType: nil,
+      width: width,
+      height: height,
+      path: path,
+      error: nil
+    )
   }
 
   static func fail(_ message: String) -> ScreenshotResult {
     return ScreenshotResult(
-      success: false, width: nil, height: nil, base64: nil, path: nil, error: message)
+      type: nil,
+      data: nil,
+      mimeType: nil,
+      width: nil,
+      height: nil,
+      path: nil,
+      error: message
+    )
   }
 }
 
@@ -160,13 +189,15 @@ final class ScreenshotController: @unchecked Sendable {
       }
     }
 
-    // Otherwise return base64
+    // Otherwise return base64 in MCP ImageContent format
     let base64 = data.base64EncodedString()
+    let mimeType = format == "png" ? "image/png" : "image/jpeg"
 
     return .ok(
       width: finalImage.width,
       height: finalImage.height,
-      base64: base64
+      data: base64,
+      mimeType: mimeType
     )
   }
 

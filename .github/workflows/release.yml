@@ -71,7 +71,7 @@ env:
       {"name": "press_key", "description": "Presses a keyboard key with optional modifiers."},
       {"name": "scroll", "description": "Scrolls in the specified direction."},
       {"name": "list_displays", "description": "Lists all connected displays with their positions and dimensions. Useful for multi-monitor setups."},
-      {"name": "take_screenshot", "description": "Captures a screenshot with multi-monitor support. Can capture main display, specific display by index, all displays combined, or a specific window. Use savePath to save to file instead of returning base64 (avoids token limits). Defaults: format=jpeg, quality=0.7, scale=0.5."},
+      {"name": "take_screenshot", "description": "Captures a screenshot with multi-monitor support. Returns images in MCP ImageContent format (type, data, mimeType) for vision model support. Can capture main display, specific display by index, all displays combined, or a specific window. Use savePath to save to file instead of returning base64. Defaults: format=jpeg, quality=0.7, scale=0.5."},
       {"name": "click_element_and_observe", "description": "Clicks an element and returns the updated UI state. Convenience method combining click_element + get_ui_elements."},
       {"name": "type_and_observe", "description": "Types text and returns the updated UI state. Convenience method combining type_text + get_ui_elements."},
       {"name": "press_key_and_observe", "description": "Presses a key and returns the updated UI state. Convenience method combining press_key + get_ui_elements."}

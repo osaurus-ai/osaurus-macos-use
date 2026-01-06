@@ -176,7 +176,7 @@ Returns:
 
 #### `take_screenshot`
 
-Captures a screenshot with multi-monitor support. Optimized defaults for minimal token usage.
+Captures a screenshot with multi-monitor support. Returns images in **MCP ImageContent format** for vision model support.
 
 **Defaults:** `format=jpeg`, `quality=0.7`, `scale=0.5` (suitable for most use cases)
 
@@ -189,13 +189,25 @@ Captures a screenshot with multi-monitor support. Optimized defaults for minimal
 { "scale": 1.0, "format": "png" }  // Full resolution PNG (larger output)
 ```
 
+Returns MCP ImageContent format (enables vision models to "see" the image):
+
+```json
+{
+  "type": "image",
+  "data": "<base64-encoded-image>",
+  "mimeType": "image/jpeg",
+  "width": 1440,
+  "height": 900
+}
+```
+
 **Save to file** - Use `savePath` to save the screenshot to disk instead of returning base64. This completely avoids token limit issues:
 
 ```json
 { "savePath": "/tmp/screenshot.jpg" }
 ```
 
-Returns: `{ "success": true, "width": 1440, "height": 900, "path": "/tmp/screenshot.jpg" }`
+Returns: `{ "width": 1440, "height": 900, "path": "/tmp/screenshot.jpg" }`
 
 ### Convenience Tools (Action + Observation combined)
 
