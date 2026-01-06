@@ -2,58 +2,60 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-// MARK: - Screenshot Result (MCP ImageContent format)
+// MARK: - MCP ImageContent (used within content array)
+
+struct MCPImageContent: Encodable {
+  let type: String  // "image"
+  let data: String  // base64-encoded image data
+  let mimeType: String  // e.g., "image/jpeg", "image/png"
+}
+
+// MARK: - MCP TextContent (used for errors and file paths)
+
+struct MCPTextContent: Encodable {
+  let type: String  // "text"
+  let text: String
+}
+
+// MARK: - Screenshot Result (MCP CallToolResult format with content array)
 
 struct ScreenshotResult: Encodable {
-  /// MCP content type - "image" for image content
-  let type: String?
-  /// Base64-encoded image data (MCP ImageContent format uses "data" field)
-  let data: String?
-  /// MIME type of the image (e.g., "image/jpeg", "image/png")
-  let mimeType: String?
-  /// Image width in pixels
-  let width: Int?
-  /// Image height in pixels
-  let height: Int?
-  /// File path when saved to disk instead of returning base64
-  let path: String?
-  /// Error message if capture failed
-  let error: String?
+  /// MCP content array - contains ImageContent or TextContent items
+  let content: [AnyCodable]
 
+  /// Creates a successful image result in MCP format
   static func ok(width: Int, height: Int, data: String, mimeType: String) -> ScreenshotResult {
-    return ScreenshotResult(
-      type: "image",
-      data: data,
-      mimeType: mimeType,
-      width: width,
-      height: height,
-      path: nil,
-      error: nil
-    )
+    let imageContent = MCPImageContent(type: "image", data: data, mimeType: mimeType)
+    return ScreenshotResult(content: [AnyCodable(imageContent)])
   }
 
+  /// Creates a successful file path result
   static func okWithPath(width: Int, height: Int, path: String) -> ScreenshotResult {
-    return ScreenshotResult(
-      type: nil,
-      data: nil,
-      mimeType: nil,
-      width: width,
-      height: height,
-      path: path,
-      error: nil
-    )
+    let textContent = MCPTextContent(
+      type: "text", text: "Screenshot saved to: \(path) (\(width)x\(height))")
+    return ScreenshotResult(content: [AnyCodable(textContent)])
   }
 
+  /// Creates an error result
   static func fail(_ message: String) -> ScreenshotResult {
-    return ScreenshotResult(
-      type: nil,
-      data: nil,
-      mimeType: nil,
-      width: nil,
-      height: nil,
-      path: nil,
-      error: message
-    )
+    let textContent = MCPTextContent(type: "text", text: "Error: \(message)")
+    return ScreenshotResult(content: [AnyCodable(textContent)])
+  }
+}
+
+// MARK: - AnyCodable wrapper for heterogeneous content array
+
+struct AnyCodable: Encodable {
+  private let _encode: (Encoder) throws -> Void
+
+  init<T: Encodable>(_ value: T) {
+    _encode = { encoder in
+      try value.encode(to: encoder)
+    }
+  }
+
+  func encode(to encoder: Encoder) throws {
+    try _encode(encoder)
   }
 }
 

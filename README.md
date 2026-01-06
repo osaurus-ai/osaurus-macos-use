@@ -189,15 +189,17 @@ Captures a screenshot with multi-monitor support. Returns images in **MCP ImageC
 { "scale": 1.0, "format": "png" }  // Full resolution PNG (larger output)
 ```
 
-Returns MCP ImageContent format (enables vision models to "see" the image):
+Returns MCP CallToolResult format with content array (enables vision models to "see" the image):
 
 ```json
 {
-  "type": "image",
-  "data": "<base64-encoded-image>",
-  "mimeType": "image/jpeg",
-  "width": 1440,
-  "height": 900
+  "content": [
+    {
+      "type": "image",
+      "data": "<base64-encoded-image>",
+      "mimeType": "image/jpeg"
+    }
+  ]
 }
 ```
 

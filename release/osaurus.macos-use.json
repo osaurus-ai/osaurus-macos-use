@@ -49,7 +49,7 @@
       },
       {
         "name": "take_screenshot",
-        "description": "Captures a screenshot with multi-monitor support. Returns images in MCP ImageContent format (type, data, mimeType) for vision model support. Can capture main display, specific display by index, all displays combined, or a specific window. Use savePath to save to file instead of returning base64. Defaults: format=jpeg, quality=0.7, scale=0.5."
+        "description": "Captures a screenshot with multi-monitor support. Returns MCP CallToolResult format with content array containing ImageContent for vision model support. Can capture main display, specific display by index, all displays combined, or a specific window. Use savePath to save to file instead of returning base64. Defaults: format=jpeg, quality=0.7, scale=0.5."
       },
       {
         "name": "click_element_and_observe",
