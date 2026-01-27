@@ -534,8 +534,12 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
     let manifest = """
       {
         "plugin_id": "osaurus.macos-use",
-        "version": "0.2.0",
+        "name": "macOS Use",
         "description": "Efficient macOS automation via accessibility APIs - supports element-based interactions, smart filtering, and decoupled actions/observations for minimal context usage",
+        "license": "MIT",
+        "authors": ["Dinoki Labs"],
+        "min_macos": "13.0",
+        "min_osaurus": "0.5.0",
         "capabilities": {
           "tools": [
             {
