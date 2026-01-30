@@ -40,6 +40,17 @@ private func runAsyncOnMain<T: Sendable>(_ block: @escaping @MainActor @Sendable
   return result
 }
 
+// MARK: - Synchronous Main Thread Helper
+
+/// Run a synchronous block on the main thread, avoiding deadlock if already on main
+private func runOnMain<T>(_ block: @Sendable () -> T) -> T {
+  if Thread.isMainThread {
+    return block()
+  } else {
+    return DispatchQueue.main.sync { block() }
+  }
+}
+
 // MARK: - Tool Implementations
 
 // MARK: Open Application Tool
@@ -83,7 +94,9 @@ private struct GetUIElementsTool {
       return jsonError("Invalid arguments: expected 'pid' field")
     }
 
-    let result = AccessibilityManager.shared.traverse(filter: filter)
+    let result = runOnMain {
+      AccessibilityManager.shared.traverse(filter: filter)
+    }
     return serializeResult(result)
   }
 }
@@ -94,7 +107,7 @@ private struct GetActiveWindowTool {
   let name = "get_active_window"
 
   func run(args: String) -> String {
-    if let windowInfo = getActiveWindow() {
+    if let windowInfo = runOnMain({ getActiveWindow() }) {
       return serializeResult(windowInfo)
     }
     return jsonError("No active window found")
@@ -343,7 +356,9 @@ private struct ClickElementAndObserveTool {
       interactiveOnly: input.interactiveOnly
     )
 
-    let traversalResult = AccessibilityManager.shared.traverse(filter: filter)
+    let traversalResult = runOnMain {
+      AccessibilityManager.shared.traverse(filter: filter)
+    }
 
     return serializeResult(
       Result(success: true, error: nil, elements: traversalResult))
@@ -395,7 +410,9 @@ private struct TypeAndObserveTool {
       interactiveOnly: input.interactiveOnly
     )
 
-    let traversalResult = AccessibilityManager.shared.traverse(filter: filter)
+    let traversalResult = runOnMain {
+      AccessibilityManager.shared.traverse(filter: filter)
+    }
 
     return serializeResult(
       Result(success: true, error: nil, elements: traversalResult))
@@ -449,7 +466,9 @@ private struct PressKeyAndObserveTool {
       interactiveOnly: input.interactiveOnly
     )
 
-    let traversalResult = AccessibilityManager.shared.traverse(filter: filter)
+    let traversalResult = runOnMain {
+      AccessibilityManager.shared.traverse(filter: filter)
+    }
 
     return serializeResult(
       Result(success: true, error: nil, elements: traversalResult))
