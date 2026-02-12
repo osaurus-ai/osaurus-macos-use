@@ -159,6 +159,8 @@ private struct ClickElementTool {
 
   struct Args: Decodable {
     let id: Int
+    let button: String?
+    let doubleClick: Bool?
   }
 
   func run(args: String) -> String {
@@ -168,28 +170,14 @@ private struct ClickElementTool {
       return jsonError("Invalid arguments: expected 'id' field")
     }
 
-    let result = ElementInteraction.shared.clickElement(id: input.id)
-    return serializeResult(result)
-  }
-}
-
-// MARK: Focus Element Tool
-
-private struct FocusElementTool {
-  let name = "focus_element"
-
-  struct Args: Decodable {
-    let id: Int
-  }
-
-  func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'id' field")
+    let result: ElementActionResult
+    if input.button?.lowercased() == "right" {
+      result = ElementInteraction.shared.rightClickElement(id: input.id)
+    } else if input.doubleClick == true {
+      result = ElementInteraction.shared.doubleClickElement(id: input.id)
+    } else {
+      result = ElementInteraction.shared.clickElement(id: input.id)
     }
-
-    let result = ElementInteraction.shared.focusElement(id: input.id)
     return serializeResult(result)
   }
 }
@@ -201,6 +189,7 @@ private struct TypeTextTool {
 
   struct Args: Decodable {
     let text: String
+    let id: Int?
   }
 
   func run(args: String) -> String {
@@ -208,6 +197,14 @@ private struct TypeTextTool {
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
       return jsonError("Invalid arguments: expected 'text' field")
+    }
+
+    // If an element ID is provided, focus it first
+    if let elementId = input.id {
+      let focusResult = ElementInteraction.shared.focusElement(id: elementId)
+      if !focusResult.success {
+        return serializeResult(focusResult)
+      }
     }
 
     let result = KeyboardController.shared.type(text: input.text)
@@ -246,6 +243,8 @@ private struct ScrollTool {
   struct Args: Decodable {
     let direction: String
     let amount: Int32?
+    let x: Double?
+    let y: Double?
   }
 
   func run(args: String) -> String {
@@ -265,7 +264,60 @@ private struct ScrollTool {
       return jsonError("Invalid direction: use 'up', 'down', 'left', or 'right'")
     }
 
+    // Move mouse to position before scrolling if coordinates are provided
+    if let x = input.x, let y = input.y {
+      _ = MouseController.shared.moveTo(CGPoint(x: x, y: y))
+    }
+
     let result = MouseController.shared.scroll(direction: direction, amount: input.amount ?? 3)
+    return serializeResult(result)
+  }
+}
+
+// MARK: Set Value Tool
+
+private struct SetValueTool {
+  let name = "set_value"
+
+  struct Args: Decodable {
+    let id: Int
+    let value: String
+  }
+
+  func run(args: String) -> String {
+    guard let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    else {
+      return jsonError("Invalid arguments: expected 'id' and 'value' fields")
+    }
+
+    let result = ElementInteraction.shared.setElementValue(id: input.id, value: input.value)
+    return serializeResult(result)
+  }
+}
+
+// MARK: Drag Tool
+
+private struct DragTool {
+  let name = "drag"
+
+  struct Args: Decodable {
+    let startX: Double
+    let startY: Double
+    let endX: Double
+    let endY: Double
+  }
+
+  func run(args: String) -> String {
+    guard let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    else {
+      return jsonError("Invalid arguments: expected 'startX', 'startY', 'endX', 'endY' fields")
+    }
+
+    let start = CGPoint(x: input.startX, y: input.startY)
+    let end = CGPoint(x: input.endX, y: input.endY)
+    let result = MouseController.shared.drag(from: start, to: end)
     return serializeResult(result)
   }
 }
@@ -300,181 +352,6 @@ private struct TakeScreenshotTool {
   }
 }
 
-// MARK: - Convenience Tools (Action + Observe)
-
-// MARK: Click Element and Observe Tool
-
-private struct ClickElementAndObserveTool {
-  let name = "click_element_and_observe"
-
-  struct Args: Decodable {
-    let id: Int
-    let maxElements: Int?
-    let interactiveOnly: Bool?
-  }
-
-  struct Result: Encodable {
-    let success: Bool
-    let error: String?
-    let elements: TraversalResult?
-  }
-
-  func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'id' field")
-    }
-
-    // Get the element's PID before clicking
-    guard let element = AccessibilityManager.shared.getElement(id: input.id) else {
-      return serializeResult(
-        Result(success: false, error: "Element not found", elements: nil))
-    }
-
-    // Get PID from element
-    var pidRef: pid_t = 0
-    AXUIElementGetPid(element.axElement, &pidRef)
-
-    // Perform the click
-    let clickResult = ElementInteraction.shared.clickElement(id: input.id)
-
-    if !clickResult.success {
-      return serializeResult(
-        Result(success: false, error: clickResult.error, elements: nil))
-    }
-
-    // Small delay for UI to update
-    Thread.sleep(forTimeInterval: 0.2)
-
-    // Traverse the UI
-    let filter = ElementFilter(
-      pid: pidRef,
-      roles: nil,
-      maxDepth: nil,
-      maxElements: input.maxElements,
-      interactiveOnly: input.interactiveOnly
-    )
-
-    let traversalResult = runOnMain {
-      AccessibilityManager.shared.traverse(filter: filter)
-    }
-
-    return serializeResult(
-      Result(success: true, error: nil, elements: traversalResult))
-  }
-}
-
-// MARK: Type and Observe Tool
-
-private struct TypeAndObserveTool {
-  let name = "type_and_observe"
-
-  struct Args: Decodable {
-    let text: String
-    let pid: Int32
-    let maxElements: Int?
-    let interactiveOnly: Bool?
-  }
-
-  struct Result: Encodable {
-    let success: Bool
-    let error: String?
-    let elements: TraversalResult?
-  }
-
-  func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'text' and 'pid' fields")
-    }
-
-    // Type the text
-    let typeResult = KeyboardController.shared.type(text: input.text)
-
-    if !typeResult.success {
-      return serializeResult(
-        Result(success: false, error: typeResult.error, elements: nil))
-    }
-
-    // Small delay for UI to update
-    Thread.sleep(forTimeInterval: 0.1)
-
-    // Traverse the UI
-    let filter = ElementFilter(
-      pid: input.pid,
-      roles: nil,
-      maxDepth: nil,
-      maxElements: input.maxElements,
-      interactiveOnly: input.interactiveOnly
-    )
-
-    let traversalResult = runOnMain {
-      AccessibilityManager.shared.traverse(filter: filter)
-    }
-
-    return serializeResult(
-      Result(success: true, error: nil, elements: traversalResult))
-  }
-}
-
-// MARK: Press Key and Observe Tool
-
-private struct PressKeyAndObserveTool {
-  let name = "press_key_and_observe"
-
-  struct Args: Decodable {
-    let key: String
-    let modifiers: [String]?
-    let pid: Int32
-    let maxElements: Int?
-    let interactiveOnly: Bool?
-  }
-
-  struct Result: Encodable {
-    let success: Bool
-    let error: String?
-    let elements: TraversalResult?
-  }
-
-  func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'key' and 'pid' fields")
-    }
-
-    // Press the key
-    let flags = parseModifierFlags(input.modifiers)
-    let keyResult = KeyboardController.shared.pressKey(keyName: input.key, modifiers: flags)
-
-    if !keyResult.success {
-      return serializeResult(
-        Result(success: false, error: keyResult.error, elements: nil))
-    }
-
-    // Small delay for UI to update
-    Thread.sleep(forTimeInterval: 0.2)
-
-    // Traverse the UI
-    let filter = ElementFilter(
-      pid: input.pid,
-      roles: nil,
-      maxDepth: nil,
-      maxElements: input.maxElements,
-      interactiveOnly: input.interactiveOnly
-    )
-
-    let traversalResult = runOnMain {
-      AccessibilityManager.shared.traverse(filter: filter)
-    }
-
-    return serializeResult(
-      Result(success: true, error: nil, elements: traversalResult))
-  }
-}
-
 // MARK: - C ABI Surface
 
 private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
@@ -502,25 +379,21 @@ private struct osr_plugin_api {
 // MARK: - Plugin Context
 
 private class PluginContext {
-  // Core action tools
+  // Action tools
   let openAppTool = OpenApplicationTool()
   let clickTool = ClickTool()
   let clickElementTool = ClickElementTool()
-  let focusElementTool = FocusElementTool()
   let typeTextTool = TypeTextTool()
+  let setValueTool = SetValueTool()
   let pressKeyTool = PressKeyTool()
   let scrollTool = ScrollTool()
+  let dragTool = DragTool()
 
   // Observation tools
   let getUIElementsTool = GetUIElementsTool()
   let getActiveWindowTool = GetActiveWindowTool()
-  let listDisplaysTool = ListDisplaysTool()
   let takeScreenshotTool = TakeScreenshotTool()
-
-  // Convenience tools
-  let clickElementAndObserveTool = ClickElementAndObserveTool()
-  let typeAndObserveTool = TypeAndObserveTool()
-  let pressKeyAndObserveTool = PressKeyAndObserveTool()
+  let listDisplaysTool = ListDisplaysTool()
 }
 
 // MARK: - Helper Functions
@@ -563,7 +436,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
           "tools": [
             {
               "id": "open_application",
-              "description": "Opens or activates an application by name, bundle ID, or path. Returns the app's PID for subsequent operations.",
+              "description": "Opens or activates an application by name, bundle ID, or path. Returns the app's PID for use with get_ui_elements.",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -579,7 +452,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
             },
             {
               "id": "get_ui_elements",
-              "description": "Traverses the accessibility tree and returns interactive UI elements with assigned IDs. Use these IDs with click_element/focus_element. Elements are filtered to reduce output size.",
+              "description": "Traverses the accessibility tree and returns interactive UI elements with assigned IDs. Use these IDs with click_element, type_text, and set_value.",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -612,7 +485,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
             },
             {
               "id": "get_active_window",
-              "description": "Returns information about the currently active window including PID, app name, title, and bounds.",
+              "description": "Returns the currently active window's PID, app name, title, and bounds.",
               "parameters": {
                 "type": "object",
                 "properties": {}
@@ -622,29 +495,21 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
             },
             {
               "id": "click_element",
-              "description": "Clicks an element by its ID (from get_ui_elements). Uses AXPress action when available, falls back to coordinate click. More reliable than raw coordinate clicks.",
+              "description": "Clicks an element by its ID (from get_ui_elements). Supports left-click, right-click, and double-click. Uses AXPress when available, falls back to coordinate click.",
               "parameters": {
                 "type": "object",
                 "properties": {
                   "id": {
                     "type": "integer",
                     "description": "Element ID from a previous get_ui_elements call"
-                  }
-                },
-                "required": ["id"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "focus_element",
-              "description": "Focuses an element by its ID. Useful for text fields before typing.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "integer",
-                    "description": "Element ID from a previous get_ui_elements call"
+                  },
+                  "button": {
+                    "type": "string",
+                    "description": "Mouse button: 'left' (default) or 'right'"
+                  },
+                  "doubleClick": {
+                    "type": "boolean",
+                    "description": "Perform a double-click (default: false)"
                   }
                 },
                 "required": ["id"]
@@ -654,7 +519,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
             },
             {
               "id": "click",
-              "description": "Clicks at raw screen coordinates. Use click_element instead when possible for better reliability.",
+              "description": "Clicks at raw screen coordinates. Only use when click_element is not possible (e.g., canvas apps, screenshot-guided clicks).",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -682,16 +547,40 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
             },
             {
               "id": "type_text",
-              "description": "Types text into the currently focused element. Focus an element first using focus_element or click_element.",
+              "description": "Types text into the focused element. Optionally pass an element ID to auto-focus it before typing.",
               "parameters": {
                 "type": "object",
                 "properties": {
                   "text": {
                     "type": "string",
                     "description": "Text to type"
+                  },
+                  "id": {
+                    "type": "integer",
+                    "description": "Element ID to focus before typing (optional — if omitted, types into the currently focused element)"
                   }
                 },
                 "required": ["text"]
+              },
+              "requirements": ["accessibility"],
+              "permission_policy": "ask"
+            },
+            {
+              "id": "set_value",
+              "description": "Directly sets the value of a text field or other editable element by its ID. More reliable than type_text for filling forms — instantly replaces the entire value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "description": "Element ID from a previous get_ui_elements call"
+                  },
+                  "value": {
+                    "type": "string",
+                    "description": "Value to set on the element"
+                  }
+                },
+                "required": ["id", "value"]
               },
               "requirements": ["accessibility"],
               "permission_policy": "ask"
@@ -719,7 +608,7 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
             },
             {
               "id": "scroll",
-              "description": "Scrolls in the specified direction.",
+              "description": "Scrolls in the specified direction. Optionally move the mouse to a position before scrolling.",
               "parameters": {
                 "type": "object",
                 "properties": {
@@ -730,6 +619,14 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
                   "amount": {
                     "type": "integer",
                     "description": "Scroll amount in pixels (default: 3)"
+                  },
+                  "x": {
+                    "type": "number",
+                    "description": "X coordinate to position mouse before scrolling (optional)"
+                  },
+                  "y": {
+                    "type": "number",
+                    "description": "Y coordinate to position mouse before scrolling (optional)"
                   }
                 },
                 "required": ["direction"]
@@ -738,28 +635,46 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
               "permission_policy": "ask"
             },
             {
-              "id": "list_displays",
-              "description": "Lists all connected displays with their positions and dimensions. Useful for multi-monitor setups.",
+              "id": "drag",
+              "description": "Drags from one screen coordinate to another. Useful for moving windows, sliders, or drag-and-drop operations.",
               "parameters": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                  "startX": {
+                    "type": "number",
+                    "description": "Starting X coordinate (screen pixels)"
+                  },
+                  "startY": {
+                    "type": "number",
+                    "description": "Starting Y coordinate (screen pixels)"
+                  },
+                  "endX": {
+                    "type": "number",
+                    "description": "Ending X coordinate (screen pixels)"
+                  },
+                  "endY": {
+                    "type": "number",
+                    "description": "Ending Y coordinate (screen pixels)"
+                  }
+                },
+                "required": ["startX", "startY", "endX", "endY"]
               },
               "requirements": ["accessibility"],
               "permission_policy": "ask"
             },
             {
               "id": "take_screenshot",
-              "description": "Captures a screenshot. Supports multi-monitor setups: capture main display, specific display by index, all displays combined, or a specific window.",
+              "description": "Captures a screenshot. Returns image in MCP ImageContent format. Defaults: format=jpeg, quality=0.7, scale=0.5.",
               "parameters": {
                 "type": "object",
                 "properties": {
                   "pid": {
                     "type": "integer",
-                    "description": "Capture only this app's window (works across all displays)"
+                    "description": "Capture only this app's window"
                   },
                   "displayIndex": {
                     "type": "integer",
-                    "description": "Display index to capture (0 = main, 1, 2, etc.). Use list_displays to see available displays."
+                    "description": "Display index to capture (0 = main). Use list_displays to see available displays."
                   },
                   "allDisplays": {
                     "type": "boolean",
@@ -767,15 +682,19 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
                   },
                   "format": {
                     "type": "string",
-                    "description": "Image format: 'png' (default) or 'jpeg'"
+                    "description": "Image format: 'jpeg' (default) or 'png'"
                   },
                   "quality": {
                     "type": "number",
-                    "description": "JPEG quality 0.0-1.0 (default: 0.8)"
+                    "description": "JPEG quality 0.0-1.0 (default: 0.7)"
                   },
                   "scale": {
                     "type": "number",
-                    "description": "Scale factor 0.0-1.0 to reduce image size (default: 1.0)"
+                    "description": "Scale factor 0.0-1.0 to reduce image size (default: 0.5)"
+                  },
+                  "savePath": {
+                    "type": "string",
+                    "description": "Save to file instead of returning base64 (avoids token limits)"
                   }
                 }
               },
@@ -783,86 +702,11 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
               "permission_policy": "ask"
             },
             {
-              "id": "click_element_and_observe",
-              "description": "Clicks an element and returns the updated UI state. Convenience method combining click_element + get_ui_elements.",
+              "id": "list_displays",
+              "description": "Lists all connected displays with their positions and dimensions.",
               "parameters": {
                 "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "integer",
-                    "description": "Element ID to click"
-                  },
-                  "maxElements": {
-                    "type": "integer",
-                    "description": "Maximum elements to return (default: 100)"
-                  },
-                  "interactiveOnly": {
-                    "type": "boolean",
-                    "description": "Only return interactive elements (default: true)"
-                  }
-                },
-                "required": ["id"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "type_and_observe",
-              "description": "Types text and returns the updated UI state. Convenience method combining type_text + get_ui_elements.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "text": {
-                    "type": "string",
-                    "description": "Text to type"
-                  },
-                  "pid": {
-                    "type": "integer",
-                    "description": "Process ID for UI traversal after typing"
-                  },
-                  "maxElements": {
-                    "type": "integer",
-                    "description": "Maximum elements to return (default: 100)"
-                  },
-                  "interactiveOnly": {
-                    "type": "boolean",
-                    "description": "Only return interactive elements (default: true)"
-                  }
-                },
-                "required": ["text", "pid"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "press_key_and_observe",
-              "description": "Presses a key and returns the updated UI state. Convenience method combining press_key + get_ui_elements.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "key": {
-                    "type": "string",
-                    "description": "Key to press"
-                  },
-                  "modifiers": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Modifier keys"
-                  },
-                  "pid": {
-                    "type": "integer",
-                    "description": "Process ID for UI traversal after key press"
-                  },
-                  "maxElements": {
-                    "type": "integer",
-                    "description": "Maximum elements to return (default: 100)"
-                  },
-                  "interactiveOnly": {
-                    "type": "boolean",
-                    "description": "Only return interactive elements (default: true)"
-                  }
-                },
-                "required": ["key", "pid"]
+                "properties": {}
               },
               "requirements": ["accessibility"],
               "permission_policy": "ask"
@@ -892,39 +736,33 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
 
     let result: String
     switch id {
-    // Core action tools
+    // Action tools
     case ctx.openAppTool.name:
       result = ctx.openAppTool.run(args: payload)
-    case ctx.clickTool.name:
-      result = ctx.clickTool.run(args: payload)
     case ctx.clickElementTool.name:
       result = ctx.clickElementTool.run(args: payload)
-    case ctx.focusElementTool.name:
-      result = ctx.focusElementTool.run(args: payload)
+    case ctx.clickTool.name:
+      result = ctx.clickTool.run(args: payload)
     case ctx.typeTextTool.name:
       result = ctx.typeTextTool.run(args: payload)
+    case ctx.setValueTool.name:
+      result = ctx.setValueTool.run(args: payload)
     case ctx.pressKeyTool.name:
       result = ctx.pressKeyTool.run(args: payload)
     case ctx.scrollTool.name:
       result = ctx.scrollTool.run(args: payload)
+    case ctx.dragTool.name:
+      result = ctx.dragTool.run(args: payload)
 
     // Observation tools
     case ctx.getUIElementsTool.name:
       result = ctx.getUIElementsTool.run(args: payload)
     case ctx.getActiveWindowTool.name:
       result = ctx.getActiveWindowTool.run(args: payload)
-    case ctx.listDisplaysTool.name:
-      result = ctx.listDisplaysTool.run(args: payload)
     case ctx.takeScreenshotTool.name:
       result = ctx.takeScreenshotTool.run(args: payload)
-
-    // Convenience tools
-    case ctx.clickElementAndObserveTool.name:
-      result = ctx.clickElementAndObserveTool.run(args: payload)
-    case ctx.typeAndObserveTool.name:
-      result = ctx.typeAndObserveTool.run(args: payload)
-    case ctx.pressKeyAndObserveTool.name:
-      result = ctx.pressKeyAndObserveTool.run(args: payload)
+    case ctx.listDisplaysTool.name:
+      result = ctx.listDisplaysTool.run(args: payload)
 
     default:
       result = jsonError("Unknown tool: \(id)")

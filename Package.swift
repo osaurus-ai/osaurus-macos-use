@@ -16,6 +16,11 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("AppKit")
             ]
+        ),
+        .testTarget(
+            name: "osaurus_macos_use_tests",
+            dependencies: ["osaurus_macos_use"],
+            path: "Tests/osaurus_macos_use_tests"
         )
     ]
 )

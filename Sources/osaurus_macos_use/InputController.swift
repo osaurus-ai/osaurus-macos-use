@@ -371,11 +371,6 @@ final class KeyboardController: @unchecked Sendable {
       return code
     }
 
-    // Single character - try to find it
-    if name.count == 1, let code = letterKeys[lowerName] {
-      return code
-    }
-
     return nil
   }
 }

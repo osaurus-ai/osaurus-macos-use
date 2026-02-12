@@ -26,7 +26,6 @@ final class ElementInteraction: @unchecked Sendable {
 
   private let accessibilityManager = AccessibilityManager.shared
   private let mouseController = MouseController.shared
-  private let keyboardController = KeyboardController.shared
 
   private init() {}
 

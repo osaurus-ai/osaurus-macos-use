@@ -341,78 +341,65 @@ struct AppError: Error, Sendable {
 
 /// Open or activate an application
 func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
-  // Try to find running app first
   let workspace = NSWorkspace.shared
   let runningApps = workspace.runningApplications
+  let lowerId = identifier.lowercased()
 
-  // Check by name
+  // Check if already running (by name or bundle ID)
   if let app = runningApps.first(where: {
-    $0.localizedName?.lowercased() == identifier.lowercased()
-  }) {
-    app.activate()
-    try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms
-    return .success(
-      AppInfo(
-        pid: app.processIdentifier, bundleId: app.bundleIdentifier,
-        name: app.localizedName ?? identifier)
-    )
-  }
-
-  // Check by bundle ID
-  if let app = runningApps.first(where: {
-    $0.bundleIdentifier?.lowercased() == identifier.lowercased()
+    $0.localizedName?.lowercased() == lowerId || $0.bundleIdentifier?.lowercased() == lowerId
   }) {
     app.activate()
     try? await Task.sleep(nanoseconds: 300_000_000)
     return .success(
       AppInfo(
-        pid: app.processIdentifier, bundleId: app.bundleIdentifier,
-        name: app.localizedName ?? identifier)
-    )
+        pid: app.processIdentifier,
+        bundleId: app.bundleIdentifier,
+        name: app.localizedName ?? identifier
+      ))
   }
 
-  // Try to launch the app
+  // Not running — try to launch
   do {
-    // Try by bundle ID
-    if let url = workspace.urlForApplication(withBundleIdentifier: identifier) {
-      let config = NSWorkspace.OpenConfiguration()
-      config.activates = true
-      let app = try await workspace.openApplication(at: url, configuration: config)
-      try? await Task.sleep(nanoseconds: 500_000_000)  // 500ms for launch
-      return .success(
-        AppInfo(
-          pid: app.processIdentifier, bundleId: app.bundleIdentifier,
-          name: app.localizedName ?? identifier)
-      )
-    }
-
-    // Try by name (search in Applications)
-    let appPaths = [
-      "/Applications/\(identifier).app",
-      "/System/Applications/\(identifier).app",
-      "/System/Applications/Utilities/\(identifier).app",
-      NSHomeDirectory() + "/Applications/\(identifier).app",
-    ]
-
-    for path in appPaths {
-      let url = URL(fileURLWithPath: path)
-      if FileManager.default.fileExists(atPath: path) {
-        let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
-        let app = try await workspace.openApplication(at: url, configuration: config)
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        return .success(
-          AppInfo(
-            pid: app.processIdentifier, bundleId: app.bundleIdentifier,
-            name: app.localizedName ?? identifier)
-        )
-      }
-    }
-
-    return .failure(AppError(message: "Application not found: \(identifier)"))
+    let app = try await launchApplication(identifier: identifier, workspace: workspace)
+    try? await Task.sleep(nanoseconds: 500_000_000)
+    return .success(
+      AppInfo(
+        pid: app.processIdentifier,
+        bundleId: app.bundleIdentifier,
+        name: app.localizedName ?? identifier
+      ))
   } catch {
     return .failure(AppError(message: "Failed to open application: \(error.localizedDescription)"))
   }
+}
+
+/// Launch an application by bundle ID or name
+private func launchApplication(
+  identifier: String, workspace: NSWorkspace
+) async throws -> NSRunningApplication {
+  let config = NSWorkspace.OpenConfiguration()
+  config.activates = true
+
+  // Try by bundle ID first
+  if let url = workspace.urlForApplication(withBundleIdentifier: identifier) {
+    return try await workspace.openApplication(at: url, configuration: config)
+  }
+
+  // Try by name in common application directories
+  let searchPaths = [
+    "/Applications/\(identifier).app",
+    "/System/Applications/\(identifier).app",
+    "/System/Applications/Utilities/\(identifier).app",
+    NSHomeDirectory() + "/Applications/\(identifier).app",
+  ]
+
+  for path in searchPaths where FileManager.default.fileExists(atPath: path) {
+    return try await workspace.openApplication(
+      at: URL(fileURLWithPath: path), configuration: config)
+  }
+
+  throw AppError(message: "Application not found: \(identifier)")
 }
 
 // MARK: - Active Window Info
