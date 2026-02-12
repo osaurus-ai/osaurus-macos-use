@@ -12,28 +12,27 @@ Automate macOS through accessibility APIs. This plugin gives you direct control 
 
 ## Core Workflow
 
-Every interaction follows the **Observe-Act** pattern:
+Every interaction follows the **Open-Observe-Act** pattern:
 
-1. **Identify the app** — `open_application` to launch/activate, returns a `pid`.
-2. **Observe the UI** — `get_ui_elements` with the `pid` to get interactive elements and their IDs.
+1. **Open the app** — `open_application` to launch/activate, returns a `pid`.
+2. **Observe the UI** — ALWAYS call `get_ui_elements` with the `pid` before doing anything else. This confirms the app is ready and gives you element IDs. **Never skip this step. Never send keyboard or mouse actions before observing.**
 3. **Act** — use element IDs to `click_element`, `type_text`, `set_value`, `press_key`, etc.
-4. **Re-observe only when the UI changes** — after navigation, opening dialogs, switching tabs, or submitting forms. Do NOT re-observe after every action.
+4. **Re-observe when the UI changes** — after navigation, dialogs, tab switches, or form submissions. Do NOT re-observe after actions that don't change the visible UI (typing, toggling, pressing shortcuts).
 
 This decoupled approach keeps token usage low. A typical 5-step interaction costs ~3K tokens vs ~150K if you re-observed after every action.
 
 ## When to Re-Observe
 
 Call `get_ui_elements` again when:
-- You clicked a button that opens a new view, dialog, or menu
-- You navigated to a new page (e.g., clicked a link in Safari)
+- You clicked a button/link that opens a new view, dialog, page, or menu
 - You switched tabs or windows
 - You submitted a form and the UI refreshed
 - An element ID returns "Element not found"
 
 Do NOT re-observe when:
-- You just typed text into a field
-- You just pressed a keyboard shortcut
-- You clicked a button that doesn't change the visible UI (e.g., a toggle)
+- You just typed text into a field (the field still has focus)
+- You just pressed a keyboard shortcut (e.g., Cmd+S to save)
+- You clicked a toggle, checkbox, or other control that doesn't change the surrounding UI
 
 ## Tool Selection Guide
 
@@ -70,32 +69,35 @@ Use `take_screenshot` with `pid` to capture a specific app window. Default setti
 2. **Keep `maxElements` low.** Default is 100. For simple UIs (dialogs, settings panes), use 30-50. For complex UIs (web pages), use 100-150.
 3. **Use `roles` filter** to narrow results. For example, `roles: ["button"]` when looking for a specific button, or `roles: ["textField", "textArea"]` when looking for input fields.
 4. **Avoid unnecessary screenshots.** Screenshots consume vision tokens. Use `get_ui_elements` first — only screenshot if you need visual context.
-5. **Batch actions without re-observing.** After observing once, perform multiple actions (click, type, press key) before re-observing.
+5. **Batch actions between observations.** After the initial observe, perform multiple actions (click, type, press key) before re-observing — but always do that initial observe after `open_application`.
 6. **Use keyboard shortcuts** instead of navigating menus. `press_key("s", modifiers: ["command"])` is cheaper than finding and clicking File > Save.
 
 ## Common Recipes
 
 ### Open an App and Inspect It
 
+Always observe after opening — never skip this step:
+
 ```
 1. open_application(identifier: "Notes")
    → { pid: 1234, name: "Notes" }
 
 2. get_ui_elements(pid: 1234)
-   → Returns elements with IDs
+   → Returns elements with IDs — app is confirmed ready
 ```
 
 ### Click a Button
 
-```
-1. get_ui_elements(pid: 1234)
-   → Find button with label "New Note", ID = 5
+After observing (step 2 above), find the element and click it:
 
-2. click_element(id: 5)
-   → { success: true }
+```
+click_element(id: 5)
+→ { success: true }
 ```
 
 ### Fill a Text Field
+
+Use `roles` to filter for input fields, then set the value:
 
 ```
 1. get_ui_elements(pid: 1234, roles: ["textField", "searchField"])
@@ -105,11 +107,11 @@ Use `take_screenshot` with `pid` to capture a specific app window. Default setti
    → { success: true }
 ```
 
-If `set_value` fails, fall back to:
+If `set_value` fails, fall back to `type_text`:
 
 ```
-2. type_text(text: "Hello, world!", id: 8)
-   → { success: true }
+type_text(text: "Hello, world!", id: 8)
+→ { success: true }
 ```
 
 ### Navigate a Menu
@@ -153,13 +155,13 @@ After an action triggers a dialog:
 
 ```
 1. open_application(identifier: "Safari")
-   → Activates Safari, returns its PID
+   → { pid: 5678 }
 
-2. get_ui_elements(pid: <safari_pid>)
-   → Safari's UI elements
+2. get_ui_elements(pid: 5678)
+   → Safari's UI elements — now safe to interact
 ```
 
-Or use keyboard: `press_key("tab", modifiers: ["command"])`
+You can also use `press_key("tab", modifiers: ["command"])` to switch, but always follow up with `get_ui_elements` before sending any input to the newly focused app.
 
 ## Safari Web Browsing
 
@@ -171,32 +173,36 @@ Safari's web content is fully accessible through the accessibility tree. Links, 
 1. open_application(identifier: "Safari")
    → { pid: 5678 }
 
-2. press_key("l", modifiers: ["command"])
+2. get_ui_elements(pid: 5678)
+   → Confirm Safari is loaded and ready
+
+3. press_key("l", modifiers: ["command"])
    → Focuses the address bar
 
-3. type_text(text: "https://example.com")
+4. type_text(text: "https://example.com")
 
-4. press_key("return")
+5. press_key("return")
    → Page loads
 
-5. get_ui_elements(pid: 5678)
+6. get_ui_elements(pid: 5678)
    → Web page elements (links, buttons, inputs)
 ```
 
 ### Click a Link on a Web Page
 
+Once Safari is open and observed:
+
 ```
-1. get_ui_elements(pid: 5678)
-   → Find link with label "Sign In", ID = 12
+1. click_element(id: 12)
+   → Navigates to sign-in page (ID 12 was "Sign In" link from observation)
 
-2. click_element(id: 12)
-   → Navigates to sign-in page
-
-3. get_ui_elements(pid: 5678)
-   → New page elements
+2. get_ui_elements(pid: 5678)
+   → New page elements (re-observe because the page changed)
 ```
 
 ### Fill a Web Form
+
+After navigating to a page with a form:
 
 ```
 1. get_ui_elements(pid: 5678, roles: ["textField"])
@@ -208,6 +214,8 @@ Safari's web content is fully accessible through the accessibility tree. Links, 
 ```
 
 ### Search the Web
+
+Assumes Safari is already open and observed (you have the `pid`):
 
 ```
 1. press_key("l", modifiers: ["command"])

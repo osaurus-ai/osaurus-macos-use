@@ -350,7 +350,7 @@ func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
     $0.localizedName?.lowercased() == lowerId || $0.bundleIdentifier?.lowercased() == lowerId
   }) {
     app.activate()
-    try? await Task.sleep(nanoseconds: 300_000_000)
+    await waitUntilReady(app: app)
     return .success(
       AppInfo(
         pid: app.processIdentifier,
@@ -362,7 +362,7 @@ func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
   // Not running — try to launch
   do {
     let app = try await launchApplication(identifier: identifier, workspace: workspace)
-    try? await Task.sleep(nanoseconds: 500_000_000)
+    await waitUntilReady(app: app, isNewLaunch: true)
     return .success(
       AppInfo(
         pid: app.processIdentifier,
@@ -372,6 +372,48 @@ func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
   } catch {
     return .failure(AppError(message: "Failed to open application: \(error.localizedDescription)"))
   }
+}
+
+/// Wait until the application is frontmost and has at least one window.
+/// Polls at short intervals with a timeout to avoid blocking indefinitely.
+private func waitUntilReady(
+  app: NSRunningApplication, isNewLaunch: Bool = false, timeoutSeconds: Double = 5.0
+) async {
+  let pollInterval: UInt64 = 100_000_000  // 100ms
+  let maxAttempts = Int(timeoutSeconds * 10)
+
+  // For activating an already-running app, give it a brief initial moment
+  let initialDelay: UInt64 = isNewLaunch ? 500_000_000 : 200_000_000
+  try? await Task.sleep(nanoseconds: initialDelay)
+
+  for _ in 0..<maxAttempts {
+    // Check that the app is frontmost
+    let isFrontmost = app.isActive
+
+    // Check that the app has at least one window via Accessibility
+    let hasWindow: Bool
+    if isFrontmost {
+      let axApp = AXUIElementCreateApplication(app.processIdentifier)
+      var windowValue: CFTypeRef?
+      let windowResult = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowValue)
+      if windowResult == .success, let windows = windowValue as? [AXUIElement], !windows.isEmpty {
+        hasWindow = true
+      } else {
+        hasWindow = false
+      }
+    } else {
+      hasWindow = false
+    }
+
+    if isFrontmost && hasWindow {
+      // App is ready — give a small extra settle time for UI rendering
+      try? await Task.sleep(nanoseconds: 200_000_000)
+      return
+    }
+
+    try? await Task.sleep(nanoseconds: pollInterval)
+  }
+  // Timeout reached — proceed anyway so the caller isn't blocked forever
 }
 
 /// Launch an application by bundle ID or name
