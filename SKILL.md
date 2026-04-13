@@ -1,9 +1,9 @@
 ---
 name: osaurus-macos-use
-description: Control macOS via accessibility APIs. Use when the user asks to interact with native Mac apps, automate UI tasks, browse the web in Safari, fill forms, navigate menus, or perform any on-screen action.
+description: Control macOS via accessibility APIs. Use when the user asks to interact with native Mac apps, automate UI tasks, browse the web in Safari, fill forms, navigate menus, or perform any on-screen action. Supports Electron apps (Claude Desktop, Discord, Figma, Linear, Notion, Obsidian, VS Code) via the enable_ax_tree bridge.
 metadata:
   author: osaurus
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Osaurus macOS Use
@@ -162,6 +162,30 @@ After an action triggers a dialog:
 ```
 
 You can also use `press_key("tab", modifiers: ["command"])` to switch, but always follow up with `get_ui_elements` before sending any input to the newly focused app.
+
+### Interact with an Electron App (Claude Desktop, Discord, Figma, Linear, Notion, Obsidian, VS Code, …)
+
+Electron apps lazy-build their accessibility tree — they wait until the OS signals that an assistive technology is running. `get_ui_elements` on a fresh Electron process returns only 2–5 window-chrome elements. Call `enable_ax_tree` once to flip the switch, then observe normally:
+
+```
+1. open_application(identifier: "Claude")
+   → { pid: 1234 }
+
+2. enable_ax_tree(pid: 1234)
+   → { ok: true, pid: 1234, enabled: true }
+   (Chromium now populates the full accessibility tree for this process.)
+
+3. get_ui_elements(pid: 1234, interactiveOnly: false, maxElements: 300)
+   → Sidebar, chat list, message input, buttons, labels — the real UI.
+
+4. … click_element, set_value, type_text as usual.
+```
+
+**When you need this:** if `get_ui_elements` returns fewer than ~10 elements on an app that visibly has a rich UI, the app is almost certainly an Electron app with a gated AX tree. Call `enable_ax_tree(pid)` and re-observe.
+
+**When you don't:** native AppKit apps (Safari, Mail, Notes, Finder, Terminal, Xcode) expose their accessibility tree eagerly — no `enable_ax_tree` call needed.
+
+**One-shot, not per-call:** the attribute sticks for the lifetime of the target process. You only need to call `enable_ax_tree` once per launch. Reference: [electron/electron#38102](https://github.com/electron/electron/pull/38102).
 
 ## Safari Web Browsing
 
@@ -383,6 +407,14 @@ Use these with `press_key` to avoid navigating menus:
 - Returns all connected displays with index, position, and dimensions.
 - Only needed for multi-monitor setups.
 
+### `enable_ax_tree`
+
+- Sets `AXManualAccessibility` on the target process, unlocking the full accessibility tree for Chromium/Electron apps that lazy-build it (Claude Desktop, Discord, Figma, Linear, Notion, Obsidian, VS Code, etc.).
+- Call once per launch, immediately after `open_application`, before `get_ui_elements`.
+- Pass `enable: false` to reverse the attribute (rarely useful — the default is enable=true).
+- Returns `{ ok, pid, enabled }` on success, or an error payload if the pid isn't running or the AX API rejects the attribute.
+- Not needed for native AppKit apps. Safe to call regardless — on apps that don't recognize the attribute, the call returns success and has no effect.
+
 ## Troubleshooting
 
 ### "Element not found"
@@ -396,6 +428,7 @@ The element may not be editable via accessibility. Fall back to `type_text` with
 ### No elements returned
 
 - Verify the `pid` is correct (use `get_active_window` to check).
+- **If the app is an Electron/Chromium app** (Claude Desktop, Discord, Figma, Linear, Notion, Obsidian, VS Code, etc.), call `enable_ax_tree(pid)` once and retry — Chromium lazy-builds its accessibility tree and `get_ui_elements` will return only window chrome until the attribute is set.
 - Some apps have poor accessibility support. Try `take_screenshot` and use coordinate-based `click` instead.
 - For web content in Safari, ensure the page has fully loaded before querying elements.
 

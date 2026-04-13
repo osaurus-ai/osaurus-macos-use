@@ -136,7 +136,7 @@ struct ManifestTests {
     let json = parseJSON(manifest)!
     let capabilities = json["capabilities"] as! [String: Any]
     let tools = capabilities["tools"] as! [[String: Any]]
-    #expect(tools.count == 12)
+    #expect(tools.count == 13)
   }
 
   @Test("Manifest contains all expected tool IDs")
@@ -166,6 +166,7 @@ struct ManifestTests {
       "drag",
       "take_screenshot",
       "list_displays",
+      "enable_ax_tree",
     ]
 
     #expect(toolIDs == expectedIDs)
@@ -283,6 +284,28 @@ struct ArgumentValidationTests {
     let result = invoke(api: api, ctx: ctx, tool: "get_ui_elements", payload: "{}")
     let json = parseJSON(result)
     #expect(json?["error"] != nil)
+  }
+
+  @Test("enable_ax_tree rejects missing pid")
+  func enableAXTreeMissingPid() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+
+    let result = invoke(api: api, ctx: ctx, tool: "enable_ax_tree", payload: "{}")
+    let json = parseJSON(result)
+    #expect(json?["error"] != nil)
+  }
+
+  @Test("enable_ax_tree rejects non-running pid")
+  func enableAXTreeNonRunningPid() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+
+    let result = invoke(api: api, ctx: ctx, tool: "enable_ax_tree", payload: "{\"pid\": 1}")
+    let json = parseJSON(result)
+    // pid 1 (launchd) is not addressable by NSRunningApplication OR the AX
+    // API refuses to set the attribute on it — either way we expect an error.
+    #expect(json?["error"] != nil || json?["ok"] as? Bool == false)
   }
 
   @Test("click rejects missing coordinates")
