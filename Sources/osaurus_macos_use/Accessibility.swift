@@ -521,3 +521,44 @@ func getActiveWindow() -> WindowInfo? {
     h: Int(size.height)
   )
 }
+
+// MARK: - Enable AX Tree (Chromium/Electron bridge)
+
+struct EnableAXTreeResult: Encodable, Sendable {
+  let ok: Bool
+  let pid: Int32
+  let enabled: Bool
+}
+
+/// Sets `AXManualAccessibility` on the target process's application element.
+///
+/// Chromium (and therefore every Electron app) lazy-builds its accessibility
+/// tree — the tree stays empty until the process sees an assistive technology
+/// signal. VoiceOver is one such signal; setting `AXManualAccessibility` on
+/// the app's AX element is another (Electron honors this attribute as of
+/// Electron 23, see electron/electron#38102).
+///
+/// Without this, calling `get_ui_elements` on Claude Desktop, Discord, Figma,
+/// Linear, Notion, Obsidian, or any other Electron app returns only a handful
+/// of window-chrome elements. After this call, the full tree (hundreds of
+/// elements) becomes visible to subsequent `get_ui_elements` calls.
+func enableAXTree(pid: Int32, enable: Bool) -> Result<EnableAXTreeResult, AppError> {
+  guard NSRunningApplication(processIdentifier: pid) != nil else {
+    return .failure(AppError(message: "No running process with pid \(pid)"))
+  }
+
+  let app = AXUIElementCreateApplication(pid)
+  let attr = "AXManualAccessibility" as CFString
+  let value: CFTypeRef = (enable ? kCFBooleanTrue : kCFBooleanFalse)!
+
+  let err = AXUIElementSetAttributeValue(app, attr, value)
+  if err == .success {
+    return .success(EnableAXTreeResult(ok: true, pid: pid, enabled: enable))
+  } else {
+    return .failure(
+      AppError(
+        message:
+          "AXUIElementSetAttributeValue(AXManualAccessibility) returned \(err.rawValue) for pid \(pid)"
+      ))
+  }
+}

@@ -114,6 +114,36 @@ private struct GetActiveWindowTool {
   }
 }
 
+// MARK: Enable AX Tree Tool (Chromium/Electron bridge)
+
+private struct EnableAXTreeTool {
+  let name = "enable_ax_tree"
+
+  struct Args: Decodable {
+    let pid: Int32
+    let enable: Bool?
+  }
+
+  func run(args: String) -> String {
+    guard let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    else {
+      return jsonError("Invalid arguments: expected 'pid' field")
+    }
+
+    let result = runOnMain {
+      enableAXTree(pid: input.pid, enable: input.enable ?? true)
+    }
+
+    switch result {
+    case .success(let info):
+      return serializeResult(info)
+    case .failure(let error):
+      return jsonError(error.message)
+    }
+  }
+}
+
 // MARK: Click Tool (Raw Coordinates)
 
 private struct ClickTool {
@@ -394,6 +424,7 @@ private class PluginContext {
   let getActiveWindowTool = GetActiveWindowTool()
   let takeScreenshotTool = TakeScreenshotTool()
   let listDisplaysTool = ListDisplaysTool()
+  let enableAXTreeTool = EnableAXTreeTool()
 }
 
 // MARK: - Helper Functions
@@ -710,6 +741,26 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
               },
               "requirements": ["accessibility"],
               "permission_policy": "ask"
+            },
+            {
+              "id": "enable_ax_tree",
+              "description": "Wakes up the accessibility tree for Chromium/Electron apps (Claude Desktop, Discord, Figma, Linear, Notion, Obsidian, VS Code, etc.) by setting AXManualAccessibility on the target process. Call this once after open_application if get_ui_elements returns only window chrome. See electron/electron#38102.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "pid": {
+                    "type": "integer",
+                    "description": "Process ID of the target application (from open_application)"
+                  },
+                  "enable": {
+                    "type": "boolean",
+                    "description": "true to enable (default), false to disable"
+                  }
+                },
+                "required": ["pid"]
+              },
+              "requirements": ["accessibility"],
+              "permission_policy": "ask"
             }
           ]
         }
@@ -763,6 +814,8 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
       result = ctx.takeScreenshotTool.run(args: payload)
     case ctx.listDisplaysTool.name:
       result = ctx.listDisplaysTool.run(args: payload)
+    case ctx.enableAXTreeTool.name:
+      result = ctx.enableAXTreeTool.run(args: payload)
 
     default:
       result = jsonError("Unknown tool: \(id)")
