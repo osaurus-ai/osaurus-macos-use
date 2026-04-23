@@ -24,7 +24,22 @@ private func serializeResult<T: Encodable>(_ value: T) -> String {
   }
 }
 
-// MARK: - Async Runner Helper
+/// Decode a tool's `Args` struct from a JSON string and run `body` with it,
+/// or return a structured error mentioning `expecting`.
+private func withArgs<Args: Decodable>(
+  _ args: String,
+  expecting: String,
+  _ body: (Args) -> String
+) -> String {
+  guard let data = args.data(using: .utf8),
+    let input = try? JSONDecoder().decode(Args.self, from: data)
+  else {
+    return jsonError("Invalid arguments: expected \(expecting)")
+  }
+  return body(input)
+}
+
+// MARK: - Async Runner Helpers
 
 private func runAsyncOnMain<T: Sendable>(_ block: @escaping @MainActor @Sendable () async -> T) -> T
 {
@@ -40,9 +55,6 @@ private func runAsyncOnMain<T: Sendable>(_ block: @escaping @MainActor @Sendable
   return result
 }
 
-// MARK: - Synchronous Main Thread Helper
-
-/// Run a synchronous block on the main thread, avoiding deadlock if already on main
 private func runOnMain<T>(_ block: @Sendable () -> T) -> T {
   if Thread.isMainThread {
     return block()
@@ -51,72 +63,165 @@ private func runOnMain<T>(_ block: @Sendable () -> T) -> T {
   }
 }
 
-// MARK: - Tool Implementations
+/// Run a UI-element traversal on the main thread. Wraps the Sendable-capture
+/// boilerplate in one place.
+private func traverse(
+  pid: Int32,
+  maxElements: Int? = nil,
+  focusedWindowOnly: Bool = false,
+  search: SearchOptions? = nil
+) -> TraversalResult {
+  var f = ElementFilter(pid: pid)
+  if let maxElements = maxElements { f.maxElements = maxElements }
+  if focusedWindowOnly { f.focusedWindowOnly = true }
+  let filter = f
+  let s = search
+  return runOnMain { AccessibilityManager.shared.traverse(filter: filter, search: s) }
+}
 
-// MARK: Open Application Tool
+// MARK: - Automation Gate
 
-private struct OpenApplicationTool {
+/// Called at the top of every action-style tool. Updates the HUD's narration
+/// and bails immediately if the user pressed Esc. Returns the bail-out JSON
+/// when cancelled, or nil to continue.
+private func gateAutomation(narration: String?) -> String? {
+  AutomationSession.shared.markActive(narration: narration)
+  if AutomationSession.shared.isCancelled() {
+    return serializeResult(ElementActionResult.cancelled())
+  }
+  return nil
+}
+
+/// Lightweight version for observation tools: keeps the HUD alive but does
+/// NOT bail on cancel - the agent should still be able to read state during
+/// or right after a cancellation.
+private func markObservation() {
+  AutomationSession.shared.markActive(narration: nil)
+}
+
+// MARK: - Tool Protocol
+
+/// Every tool conforms to this. The C-ABI invoke layer routes by `name`.
+/// Tools are stateless value types, so `Sendable` conformance is safe.
+private protocol Tool: Sendable {
+  var name: String { get }
+  func run(args: String) -> String
+}
+
+// MARK: - Open Application Tool
+
+private struct OpenApplicationTool: Tool {
   let name = "open_application"
 
   struct Args: Decodable {
     let identifier: String
+    let observe: Bool?
+    let maxElements: Int?
+    let narration: String?
+  }
+
+  struct Result: Encodable {
+    let pid: Int32
+    let bundleId: String?
+    let name: String
+    let snapshot: TraversalResult?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'identifier' field")
-    }
-
-    let result: Result<AppInfo, AppError> = runAsyncOnMain {
-      await openApplication(identifier: input.identifier)
-    }
-
-    switch result {
-    case .success(let info):
-      return serializeResult(info)
-    case .failure(let error):
-      return jsonError(error.message)
+    withArgs(args, expecting: "'identifier' field") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration ?? "Opening \(input.identifier)...") {
+        return bail
+      }
+      let opened: Swift.Result<AppInfo, AppError> = runAsyncOnMain {
+        await openApplication(identifier: input.identifier)
+      }
+      switch opened {
+      case .failure(let error):
+        return jsonError(error.message)
+      case .success(let info):
+        let snapshot: TraversalResult? =
+          (input.observe ?? true)
+          ? traverse(pid: info.pid, maxElements: input.maxElements ?? 150)
+          : nil
+        return serializeResult(
+          Result(pid: info.pid, bundleId: info.bundleId, name: info.name, snapshot: snapshot))
+      }
     }
   }
 }
 
-// MARK: Get UI Elements Tool
+// MARK: - Get UI Elements Tool
 
-private struct GetUIElementsTool {
+private struct GetUIElementsTool: Tool {
   let name = "get_ui_elements"
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let filter = try? JSONDecoder().decode(ElementFilter.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'pid' field")
+    withArgs(args, expecting: "'pid' field") { (filter: ElementFilter) in
+      markObservation()
+      return serializeResult(runOnMain { AccessibilityManager.shared.traverse(filter: filter) })
     }
-
-    let result = runOnMain {
-      AccessibilityManager.shared.traverse(filter: filter)
-    }
-    return serializeResult(result)
   }
 }
 
-// MARK: Get Active Window Tool
+// MARK: - Find Elements Tool
 
-private struct GetActiveWindowTool {
+private struct FindElementsTool: Tool {
+  let name = "find_elements"
+
+  struct Args: Decodable {
+    let pid: Int32
+    let text: String?
+    let role: String?
+    let roles: [String]?
+    let windowId: Int?
+    let enabledOnly: Bool?
+    let limit: Int?
+    let maxDepth: Int?
+    let interactiveOnly: Bool?
+  }
+
+  func run(args: String) -> String {
+    withArgs(args, expecting: "'pid' field") { (input: Args) in
+      markObservation()
+      let limit = input.limit ?? 10
+      let roles = input.roles ?? input.role.map { [$0] }
+
+      var f = ElementFilter(pid: input.pid)
+      f.roles = roles
+      f.maxDepth = input.maxDepth ?? 25
+      f.maxElements = limit
+      f.interactiveOnly = input.interactiveOnly ?? true
+      let filter = f
+
+      let search = SearchOptions(
+        text: input.text,
+        enabledOnly: input.enabledOnly ?? false,
+        windowId: input.windowId,
+        limit: limit
+      )
+      return serializeResult(
+        runOnMain { AccessibilityManager.shared.traverse(filter: filter, search: search) })
+    }
+  }
+}
+
+// MARK: - Get Active Window Tool
+
+private struct GetActiveWindowTool: Tool {
   let name = "get_active_window"
 
   func run(args: String) -> String {
-    if let windowInfo = runOnMain({ getActiveWindow() }) {
-      return serializeResult(windowInfo)
+    markObservation()
+    if let info = runOnMain({ getActiveWindow() }) {
+      return serializeResult(info)
     }
     return jsonError("No active window found")
   }
 }
 
-// MARK: Click Tool (Raw Coordinates)
+// MARK: - Click Tool (Raw Coordinates)
 
-private struct ClickTool {
+private struct ClickTool: Tool {
   let name = "click"
 
   struct Args: Decodable {
@@ -124,120 +229,129 @@ private struct ClickTool {
     let y: Double
     let button: String?
     let doubleClick: Bool?
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'x' and 'y' fields")
+    withArgs(args, expecting: "'x' and 'y' fields") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      let point = CGPoint(x: input.x, y: input.y)
+      let button: MouseButton =
+        switch input.button?.lowercased() {
+        case "right": .right
+        case "center", "middle": .center
+        default: .left
+        }
+      let result: InputResult =
+        (input.doubleClick == true)
+        ? MouseController.shared.doubleClick(at: point, button: button)
+        : MouseController.shared.click(at: point, button: button)
+      return serializeResult(result)
     }
-
-    let point = CGPoint(x: input.x, y: input.y)
-    let button: MouseButton =
-      switch input.button?.lowercased() {
-      case "right": .right
-      case "center", "middle": .center
-      default: .left
-      }
-
-    let result: InputResult
-    if input.doubleClick == true {
-      result = MouseController.shared.doubleClick(at: point, button: button)
-    } else {
-      result = MouseController.shared.click(at: point, button: button)
-    }
-
-    return serializeResult(result)
   }
 }
 
-// MARK: Click Element Tool
+// MARK: - Click Element Tool
 
-private struct ClickElementTool {
+private struct ClickElementTool: Tool {
   let name = "click_element"
 
   struct Args: Decodable {
-    let id: Int
+    let id: String
     let button: String?
     let doubleClick: Bool?
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'id' field")
+    withArgs(args, expecting: "'id' field (string, e.g. 's1-5')") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      let result: ElementActionResult
+      if input.button?.lowercased() == "right" {
+        result = ElementInteraction.shared.rightClickElement(id: input.id)
+      } else if input.doubleClick == true {
+        result = ElementInteraction.shared.doubleClickElement(id: input.id)
+      } else {
+        result = ElementInteraction.shared.clickElement(id: input.id)
+      }
+      return serializeResult(result)
     }
-
-    let result: ElementActionResult
-    if input.button?.lowercased() == "right" {
-      result = ElementInteraction.shared.rightClickElement(id: input.id)
-    } else if input.doubleClick == true {
-      result = ElementInteraction.shared.doubleClickElement(id: input.id)
-    } else {
-      result = ElementInteraction.shared.clickElement(id: input.id)
-    }
-    return serializeResult(result)
   }
 }
 
-// MARK: Type Text Tool
+// MARK: - Type Text Tool
 
-private struct TypeTextTool {
+private struct TypeTextTool: Tool {
   let name = "type_text"
 
   struct Args: Decodable {
     let text: String
-    let id: Int?
+    let id: String?
+    let replace: Bool?
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'text' field")
-    }
+    withArgs(args, expecting: "'text' field") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
 
-    // If an element ID is provided, focus it first
-    if let elementId = input.id {
-      let focusResult = ElementInteraction.shared.focusElement(id: elementId)
-      if !focusResult.success {
-        return serializeResult(focusResult)
+      if let elementId = input.id {
+        let focusResult = ElementInteraction.shared.focusElement(id: elementId)
+        if !focusResult.success {
+          return serializeResult(focusResult)
+        }
+        if input.replace ?? true {
+          // Best-effort clear; some fields aren't AX-clearable, in which case
+          // typing simply appends. Skip the explicit error path on stale/removed/cancelled.
+          _ = ElementInteraction.shared.clearElement(id: elementId)
+        }
       }
-    }
 
-    let result = KeyboardController.shared.type(text: input.text)
-    return serializeResult(result)
+      let result = KeyboardController.shared.type(text: input.text)
+      if result.success {
+        let pid = input.id.flatMap { AccessibilityManager.shared.pid(for: $0) }
+        let delta = pid.flatMap { computeFocusDelta(pid: $0) }
+        return serializeResult(ElementActionResult.ok(delta: delta))
+      }
+      // KeyboardController.type returns the cancellation message verbatim.
+      if result.error?.contains("Cancelled by user") == true {
+        return serializeResult(ElementActionResult.cancelled())
+      }
+      return serializeResult(ElementActionResult.fail(result.error ?? "Type failed"))
+    }
   }
 }
 
-// MARK: Press Key Tool
+// MARK: - Press Key Tool
 
-private struct PressKeyTool {
+private struct PressKeyTool: Tool {
   let name = "press_key"
 
   struct Args: Decodable {
     let key: String
     let modifiers: [String]?
+    let pid: Int32?
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'key' field")
+    withArgs(args, expecting: "'key' field") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      let flags = parseModifierFlags(input.modifiers)
+      let result = KeyboardController.shared.pressKey(keyName: input.key, modifiers: flags)
+      if result.success {
+        let pid = input.pid ?? AccessibilityManager.shared.mostRecentPid()
+        let delta = pid.flatMap { computeFocusDelta(pid: $0) }
+        return serializeResult(ElementActionResult.ok(delta: delta))
+      }
+      return serializeResult(ElementActionResult.fail(result.error ?? "Press key failed"))
     }
-
-    let flags = parseModifierFlags(input.modifiers)
-    let result = KeyboardController.shared.pressKey(keyName: input.key, modifiers: flags)
-    return serializeResult(result)
   }
 }
 
-// MARK: Scroll Tool
+// MARK: - Scroll Tool
 
-private struct ScrollTool {
+private struct ScrollTool: Tool {
   let name = "scroll"
 
   struct Args: Decodable {
@@ -245,60 +359,71 @@ private struct ScrollTool {
     let amount: Int32?
     let x: Double?
     let y: Double?
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'direction' field")
+    withArgs(args, expecting: "'direction' field") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      let direction: ScrollDirection
+      switch input.direction.lowercased() {
+      case "up": direction = .up
+      case "down": direction = .down
+      case "left": direction = .left
+      case "right": direction = .right
+      default:
+        return jsonError("Invalid direction: use 'up', 'down', 'left', or 'right'")
+      }
+      if let x = input.x, let y = input.y {
+        _ = MouseController.shared.moveTo(CGPoint(x: x, y: y))
+      }
+      let result = MouseController.shared.scroll(direction: direction, amount: input.amount ?? 3)
+      return serializeResult(result)
     }
-
-    let direction: ScrollDirection
-    switch input.direction.lowercased() {
-    case "up": direction = .up
-    case "down": direction = .down
-    case "left": direction = .left
-    case "right": direction = .right
-    default:
-      return jsonError("Invalid direction: use 'up', 'down', 'left', or 'right'")
-    }
-
-    // Move mouse to position before scrolling if coordinates are provided
-    if let x = input.x, let y = input.y {
-      _ = MouseController.shared.moveTo(CGPoint(x: x, y: y))
-    }
-
-    let result = MouseController.shared.scroll(direction: direction, amount: input.amount ?? 3)
-    return serializeResult(result)
   }
 }
 
-// MARK: Set Value Tool
+// MARK: - Set Value Tool
 
-private struct SetValueTool {
+private struct SetValueTool: Tool {
   let name = "set_value"
 
   struct Args: Decodable {
-    let id: Int
+    let id: String
     let value: String
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'id' and 'value' fields")
+    withArgs(args, expecting: "'id' (string) and 'value' fields") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      return serializeResult(
+        ElementInteraction.shared.setElementValue(id: input.id, value: input.value))
     }
-
-    let result = ElementInteraction.shared.setElementValue(id: input.id, value: input.value)
-    return serializeResult(result)
   }
 }
 
-// MARK: Drag Tool
+// MARK: - Clear Field Tool
 
-private struct DragTool {
+private struct ClearFieldTool: Tool {
+  let name = "clear_field"
+
+  struct Args: Decodable {
+    let id: String
+    let narration: String?
+  }
+
+  func run(args: String) -> String {
+    withArgs(args, expecting: "'id' field (string, e.g. 's1-5')") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      return serializeResult(ElementInteraction.shared.clearElement(id: input.id))
+    }
+  }
+}
+
+// MARK: - Drag Tool
+
+private struct DragTool: Tool {
   let name = "drag"
 
   struct Args: Decodable {
@@ -306,51 +431,238 @@ private struct DragTool {
     let startY: Double
     let endX: Double
     let endY: Double
+    let narration: String?
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
-      let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      return jsonError("Invalid arguments: expected 'startX', 'startY', 'endX', 'endY' fields")
+    withArgs(args, expecting: "'startX', 'startY', 'endX', 'endY' fields") { (input: Args) in
+      if let bail = gateAutomation(narration: input.narration) { return bail }
+      return serializeResult(
+        MouseController.shared.drag(
+          from: CGPoint(x: input.startX, y: input.startY),
+          to: CGPoint(x: input.endX, y: input.endY)))
     }
-
-    let start = CGPoint(x: input.startX, y: input.startY)
-    let end = CGPoint(x: input.endX, y: input.endY)
-    let result = MouseController.shared.drag(from: start, to: end)
-    return serializeResult(result)
   }
 }
 
-// MARK: List Displays Tool
+// MARK: - List Displays Tool
 
-private struct ListDisplaysTool {
+private struct ListDisplaysTool: Tool {
   let name = "list_displays"
 
   func run(args: String) -> String {
-    let result = ScreenshotController.shared.listDisplays()
-    return serializeResult(result)
+    serializeResult(ScreenshotController.shared.listDisplays())
   }
 }
 
-// MARK: Take Screenshot Tool
+// MARK: - Take Screenshot Tool
 
-private struct TakeScreenshotTool {
+private struct TakeScreenshotTool: Tool {
   let name = "take_screenshot"
 
   func run(args: String) -> String {
     var options = ScreenshotOptions()
-
-    if !args.isEmpty, let data = args.data(using: .utf8) {
-      if let parsed = try? JSONDecoder().decode(ScreenshotOptions.self, from: data) {
-        options = parsed
-      }
+    if !args.isEmpty, let data = args.data(using: .utf8),
+      let parsed = try? JSONDecoder().decode(ScreenshotOptions.self, from: data)
+    {
+      options = parsed
     }
-
-    let result = ScreenshotController.shared.capture(options: options)
-    return serializeResult(result)
+    markObservation()
+    return serializeResult(ScreenshotController.shared.capture(options: options))
   }
 }
+
+// MARK: - Act and Observe Tool
+
+/// Run an element action and re-observe in one round-trip. Implemented as a
+/// dispatcher that re-routes args through the underlying tool and bolts a
+/// fresh snapshot onto the response.
+private struct ActAndObserveTool: Tool {
+  let name = "act_and_observe"
+
+  struct CombinedResult: Encodable {
+    let action: ElementActionResult
+    let snapshot: TraversalResult?
+    let snapshotError: String?
+  }
+
+  /// Dispatch table mapping action names to the underlying tool implementation.
+  private static let actions: [String: Tool] = {
+    let tools: [Tool] = [
+      ClickElementTool(), SetValueTool(), TypeTextTool(),
+      PressKeyTool(), ClearFieldTool(),
+    ]
+    return Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+  }()
+
+  func run(args: String) -> String {
+    guard let data = args.data(using: .utf8),
+      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    else {
+      return jsonError("Invalid arguments: expected JSON object")
+    }
+    guard let actionName = obj["action"] as? String else {
+      return jsonError(
+        "Missing 'action' field. Supported: \(Self.actions.keys.sorted().joined(separator: ", "))")
+    }
+    guard let tool = Self.actions[actionName] else {
+      return jsonError(
+        "Unsupported action '\(actionName)'. Supported: "
+          + Self.actions.keys.sorted().joined(separator: ", "))
+    }
+
+    let observeMode = (obj["observe"] as? String) ?? "full"
+    let pidFromArgs: Int32? = (obj["pid"] as? Int).map { Int32($0) }
+
+    var subArgs = obj
+    subArgs.removeValue(forKey: "action")
+    subArgs.removeValue(forKey: "observe")
+    subArgs.removeValue(forKey: "pid")
+    let subPayload =
+      (try? JSONSerialization.data(withJSONObject: subArgs))
+      .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+    let actionJSON = tool.run(args: subPayload)
+    let actionResult: ElementActionResult = {
+      guard let d = actionJSON.data(using: .utf8),
+        let parsed = try? JSONDecoder().decode(ElementActionResult.self, from: d)
+      else {
+        return .fail(actionJSON)
+      }
+      return parsed
+    }()
+
+    if observeMode == "none" {
+      return serializeResult(
+        CombinedResult(action: actionResult, snapshot: nil, snapshotError: nil))
+    }
+
+    let pid: Int32? =
+      pidFromArgs
+      ?? (subArgs["id"] as? String).flatMap { AccessibilityManager.shared.pid(for: $0) }
+      ?? AccessibilityManager.shared.mostRecentPid()
+    guard let pid = pid else {
+      return serializeResult(
+        CombinedResult(
+          action: actionResult, snapshot: nil,
+          snapshotError:
+            "Cannot observe: no pid available. Pass 'pid' explicitly to act_and_observe."))
+    }
+
+    let snapshot = traverse(
+      pid: pid,
+      maxElements: (obj["maxElements"] as? Int) ?? 150,
+      focusedWindowOnly: observeMode == "focused_window"
+    )
+    return serializeResult(
+      CombinedResult(action: actionResult, snapshot: snapshot, snapshotError: nil))
+  }
+}
+
+// MARK: - Session Tools
+
+/// Common envelope for session tool responses.
+private struct SessionResult: Encodable {
+  let success: Bool
+  let title: String
+  let isActive: Bool
+  let isCancelled: Bool
+  let stepIndex: Int?
+  let totalSteps: Int?
+  let narration: String?
+
+  static func current(success: Bool = true) -> SessionResult {
+    let s = AutomationSession.shared.currentState()
+    return SessionResult(
+      success: success, title: s.title, isActive: s.isActive, isCancelled: s.isCancelled,
+      stepIndex: s.stepIndex, totalSteps: s.totalSteps, narration: s.narration)
+  }
+}
+
+private struct StartAutomationSessionTool: Tool {
+  let name = "start_automation_session"
+
+  struct Args: Decodable {
+    let title: String
+    let totalSteps: Int?
+    let narration: String?
+  }
+
+  func run(args: String) -> String {
+    withArgs(args, expecting: "'title' field") { (input: Args) in
+      AutomationSession.shared.startSession(
+        title: input.title, totalSteps: input.totalSteps, narration: input.narration)
+      return serializeResult(SessionResult.current())
+    }
+  }
+}
+
+private struct UpdateAutomationSessionTool: Tool {
+  let name = "update_automation_session"
+
+  struct Args: Decodable {
+    let title: String?
+    let narration: String?
+    let stepIndex: Int?
+    let totalSteps: Int?
+  }
+
+  func run(args: String) -> String {
+    withArgs(args, expecting: "at least one of 'title', 'narration', 'stepIndex', 'totalSteps'") {
+      (input: Args) in
+      AutomationSession.shared.updateSession(
+        title: input.title, narration: input.narration,
+        stepIndex: input.stepIndex, totalSteps: input.totalSteps)
+      return serializeResult(SessionResult.current())
+    }
+  }
+}
+
+private struct EndAutomationSessionTool: Tool {
+  let name = "end_automation_session"
+
+  struct Args: Decodable {
+    let reason: String?
+  }
+
+  func run(args: String) -> String {
+    var reason: String? = nil
+    if !args.isEmpty, let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    {
+      reason = input.reason
+    }
+    AutomationSession.shared.endSession(reason: reason)
+    return serializeResult(SessionResult.current())
+  }
+}
+
+// MARK: - Tool Registry
+
+/// All tools, keyed by their public name. Single source of truth for routing.
+private let toolRegistry: [String: Tool] = {
+  let tools: [Tool] = [
+    OpenApplicationTool(),
+    GetUIElementsTool(),
+    FindElementsTool(),
+    GetActiveWindowTool(),
+    ClickElementTool(),
+    ClickTool(),
+    TypeTextTool(),
+    SetValueTool(),
+    ClearFieldTool(),
+    PressKeyTool(),
+    ScrollTool(),
+    DragTool(),
+    ActAndObserveTool(),
+    TakeScreenshotTool(),
+    ListDisplaysTool(),
+    StartAutomationSessionTool(),
+    UpdateAutomationSessionTool(),
+    EndAutomationSessionTool(),
+  ]
+  return Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
+}()
 
 // MARK: - C ABI Surface
 
@@ -376,27 +688,9 @@ private struct osr_plugin_api {
   var invoke: osr_invoke_t?
 }
 
-// MARK: - Plugin Context
-
-private class PluginContext {
-  // Action tools
-  let openAppTool = OpenApplicationTool()
-  let clickTool = ClickTool()
-  let clickElementTool = ClickElementTool()
-  let typeTextTool = TypeTextTool()
-  let setValueTool = SetValueTool()
-  let pressKeyTool = PressKeyTool()
-  let scrollTool = ScrollTool()
-  let dragTool = DragTool()
-
-  // Observation tools
-  let getUIElementsTool = GetUIElementsTool()
-  let getActiveWindowTool = GetActiveWindowTool()
-  let takeScreenshotTool = TakeScreenshotTool()
-  let listDisplaysTool = ListDisplaysTool()
-}
-
-// MARK: - Helper Functions
+/// Opaque handle the host uses to reference the plugin. Currently empty —
+/// state lives in the singletons (`AutomationSession`, `AccessibilityManager`).
+private final class PluginContext {}
 
 private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
   guard let ptr = strdup(s) else { return nil }
@@ -413,319 +707,26 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
   }
 
   api.`init` = {
-    let ctx = PluginContext()
-    return Unmanaged.passRetained(ctx).toOpaque()
+    Unmanaged.passRetained(PluginContext()).toOpaque()
   }
 
   api.destroy = { ctxPtr in
-    guard let ctxPtr = ctxPtr else { return }
-    Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
+    // Tear down any visible HUD / Esc tap before the plugin context goes
+    // away, otherwise a dangling NSPanel and event tap would outlive us.
+    AutomationSession.shared.endSession(reason: "plugin destroyed")
+    if let ctxPtr = ctxPtr {
+      Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
+    }
   }
 
   api.get_manifest = { _ in
-    let manifest = """
-      {
-        "plugin_id": "osaurus.macos-use",
-        "name": "macOS Use",
-        "description": "Efficient macOS automation via accessibility APIs - supports element-based interactions, smart filtering, and decoupled actions/observations for minimal context usage",
-        "license": "MIT",
-        "authors": ["Dinoki Labs"],
-        "min_macos": "13.0",
-        "min_osaurus": "0.5.0",
-        "capabilities": {
-          "tools": [
-            {
-              "id": "open_application",
-              "description": "Opens or activates an application by name, bundle ID, or path. Returns the app's PID for use with get_ui_elements.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "identifier": {
-                    "type": "string",
-                    "description": "Application name (e.g., 'Safari'), bundle ID (e.g., 'com.apple.Safari'), or file path"
-                  }
-                },
-                "required": ["identifier"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "get_ui_elements",
-              "description": "Traverses the accessibility tree and returns interactive UI elements with assigned IDs. Use these IDs with click_element, type_text, and set_value.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "pid": {
-                    "type": "integer",
-                    "description": "Process ID of the target application"
-                  },
-                  "maxElements": {
-                    "type": "integer",
-                    "description": "Maximum number of elements to return (default: 100)"
-                  },
-                  "maxDepth": {
-                    "type": "integer",
-                    "description": "Maximum tree depth to traverse (default: 15)"
-                  },
-                  "interactiveOnly": {
-                    "type": "boolean",
-                    "description": "Only return interactive elements like buttons, links, text fields (default: true)"
-                  },
-                  "roles": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Filter to specific roles (e.g., ['button', 'textField'])"
-                  }
-                },
-                "required": ["pid"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "get_active_window",
-              "description": "Returns the currently active window's PID, app name, title, and bounds.",
-              "parameters": {
-                "type": "object",
-                "properties": {}
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "click_element",
-              "description": "Clicks an element by its ID (from get_ui_elements). Supports left-click, right-click, and double-click. Uses AXPress when available, falls back to coordinate click.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "integer",
-                    "description": "Element ID from a previous get_ui_elements call"
-                  },
-                  "button": {
-                    "type": "string",
-                    "description": "Mouse button: 'left' (default) or 'right'"
-                  },
-                  "doubleClick": {
-                    "type": "boolean",
-                    "description": "Perform a double-click (default: false)"
-                  }
-                },
-                "required": ["id"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "click",
-              "description": "Clicks at raw screen coordinates. Only use when click_element is not possible (e.g., canvas apps, screenshot-guided clicks).",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "x": {
-                    "type": "number",
-                    "description": "X coordinate (screen pixels)"
-                  },
-                  "y": {
-                    "type": "number",
-                    "description": "Y coordinate (screen pixels)"
-                  },
-                  "button": {
-                    "type": "string",
-                    "description": "Mouse button: 'left' (default), 'right', or 'center'"
-                  },
-                  "doubleClick": {
-                    "type": "boolean",
-                    "description": "Perform a double-click (default: false)"
-                  }
-                },
-                "required": ["x", "y"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "type_text",
-              "description": "Types text into the focused element. Optionally pass an element ID to auto-focus it before typing.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "text": {
-                    "type": "string",
-                    "description": "Text to type"
-                  },
-                  "id": {
-                    "type": "integer",
-                    "description": "Element ID to focus before typing (optional — if omitted, types into the currently focused element)"
-                  }
-                },
-                "required": ["text"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "set_value",
-              "description": "Directly sets the value of a text field or other editable element by its ID. More reliable than type_text for filling forms — instantly replaces the entire value.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "id": {
-                    "type": "integer",
-                    "description": "Element ID from a previous get_ui_elements call"
-                  },
-                  "value": {
-                    "type": "string",
-                    "description": "Value to set on the element"
-                  }
-                },
-                "required": ["id", "value"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "press_key",
-              "description": "Presses a keyboard key with optional modifiers.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "key": {
-                    "type": "string",
-                    "description": "Key name: 'return', 'escape', 'tab', 'delete', 'space', 'up', 'down', 'left', 'right', 'f1'-'f12', or a letter/number"
-                  },
-                  "modifiers": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Modifier keys: 'command', 'shift', 'option', 'control'"
-                  }
-                },
-                "required": ["key"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "scroll",
-              "description": "Scrolls in the specified direction. Optionally move the mouse to a position before scrolling.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "direction": {
-                    "type": "string",
-                    "description": "Scroll direction: 'up', 'down', 'left', or 'right'"
-                  },
-                  "amount": {
-                    "type": "integer",
-                    "description": "Scroll amount in pixels (default: 3)"
-                  },
-                  "x": {
-                    "type": "number",
-                    "description": "X coordinate to position mouse before scrolling (optional)"
-                  },
-                  "y": {
-                    "type": "number",
-                    "description": "Y coordinate to position mouse before scrolling (optional)"
-                  }
-                },
-                "required": ["direction"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "drag",
-              "description": "Drags from one screen coordinate to another. Useful for moving windows, sliders, or drag-and-drop operations.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "startX": {
-                    "type": "number",
-                    "description": "Starting X coordinate (screen pixels)"
-                  },
-                  "startY": {
-                    "type": "number",
-                    "description": "Starting Y coordinate (screen pixels)"
-                  },
-                  "endX": {
-                    "type": "number",
-                    "description": "Ending X coordinate (screen pixels)"
-                  },
-                  "endY": {
-                    "type": "number",
-                    "description": "Ending Y coordinate (screen pixels)"
-                  }
-                },
-                "required": ["startX", "startY", "endX", "endY"]
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "take_screenshot",
-              "description": "Captures a screenshot. Returns image in MCP ImageContent format. Defaults: format=jpeg, quality=0.7, scale=0.5.",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "pid": {
-                    "type": "integer",
-                    "description": "Capture only this app's window"
-                  },
-                  "displayIndex": {
-                    "type": "integer",
-                    "description": "Display index to capture (0 = main). Use list_displays to see available displays."
-                  },
-                  "allDisplays": {
-                    "type": "boolean",
-                    "description": "Capture all displays as one combined image"
-                  },
-                  "format": {
-                    "type": "string",
-                    "description": "Image format: 'jpeg' (default) or 'png'"
-                  },
-                  "quality": {
-                    "type": "number",
-                    "description": "JPEG quality 0.0-1.0 (default: 0.7)"
-                  },
-                  "scale": {
-                    "type": "number",
-                    "description": "Scale factor 0.0-1.0 to reduce image size (default: 0.5)"
-                  },
-                  "savePath": {
-                    "type": "string",
-                    "description": "Save to file instead of returning base64 (avoids token limits)"
-                  }
-                }
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "list_displays",
-              "description": "Lists all connected displays with their positions and dimensions.",
-              "parameters": {
-                "type": "object",
-                "properties": {}
-              },
-              "requirements": ["accessibility"],
-              "permission_policy": "ask"
-            }
-          ]
-        }
-      }
-      """
-    return makeCString(manifest)
+    makeCString(PluginManifest.json)
   }
 
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
-    guard let ctxPtr = ctxPtr,
-      let typePtr = typePtr,
-      let idPtr = idPtr,
-      let payloadPtr = payloadPtr
-    else { return nil }
-
-    let ctx = Unmanaged<PluginContext>.fromOpaque(ctxPtr).takeUnretainedValue()
+  api.invoke = { _, typePtr, idPtr, payloadPtr in
+    guard let typePtr = typePtr, let idPtr = idPtr, let payloadPtr = payloadPtr else {
+      return nil
+    }
     let type = String(cString: typePtr)
     let id = String(cString: idPtr)
     let payload = String(cString: payloadPtr)
@@ -733,42 +734,10 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
     guard type == "tool" else {
       return makeCString(jsonError("Unknown capability type: \(type)"))
     }
-
-    let result: String
-    switch id {
-    // Action tools
-    case ctx.openAppTool.name:
-      result = ctx.openAppTool.run(args: payload)
-    case ctx.clickElementTool.name:
-      result = ctx.clickElementTool.run(args: payload)
-    case ctx.clickTool.name:
-      result = ctx.clickTool.run(args: payload)
-    case ctx.typeTextTool.name:
-      result = ctx.typeTextTool.run(args: payload)
-    case ctx.setValueTool.name:
-      result = ctx.setValueTool.run(args: payload)
-    case ctx.pressKeyTool.name:
-      result = ctx.pressKeyTool.run(args: payload)
-    case ctx.scrollTool.name:
-      result = ctx.scrollTool.run(args: payload)
-    case ctx.dragTool.name:
-      result = ctx.dragTool.run(args: payload)
-
-    // Observation tools
-    case ctx.getUIElementsTool.name:
-      result = ctx.getUIElementsTool.run(args: payload)
-    case ctx.getActiveWindowTool.name:
-      result = ctx.getActiveWindowTool.run(args: payload)
-    case ctx.takeScreenshotTool.name:
-      result = ctx.takeScreenshotTool.run(args: payload)
-    case ctx.listDisplaysTool.name:
-      result = ctx.listDisplaysTool.run(args: payload)
-
-    default:
-      result = jsonError("Unknown tool: \(id)")
+    guard let tool = toolRegistry[id] else {
+      return makeCString(jsonError("Unknown tool: \(id)"))
     }
-
-    return makeCString(result)
+    return makeCString(tool.run(args: payload))
   }
 
   return api

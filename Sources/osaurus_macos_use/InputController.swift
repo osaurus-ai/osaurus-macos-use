@@ -31,6 +31,27 @@ enum ScrollDirection {
   case right
 }
 
+/// Shared event source used for all synthesized input. Has a small
+/// `localEventsSuppressionInterval` so an involuntary trackpad bump or stray
+/// keystroke is dropped during synthesized events. The "real" defense against
+/// user input is the visible HUD + Esc cancellation, this is just a safety net.
+private enum SharedEventSource {
+  static let defaultSuppressionInterval: TimeInterval = 0.05
+
+  // CGEventSource is a CoreFoundation class without Sendable conformance.
+  // Mutation is single-threaded in practice (only adjusted by KeyboardController.type
+  // around long pastes); we mark it nonisolated(unsafe) and accept the trade.
+  nonisolated(unsafe) static let source: CGEventSource = {
+    let src = CGEventSource(stateID: .hidSystemState) ?? CGEventSource(stateID: .privateState)!
+    src.localEventsSuppressionInterval = defaultSuppressionInterval
+    return src
+  }()
+
+  static func setSuppression(_ interval: TimeInterval) {
+    source.localEventsSuppressionInterval = interval
+  }
+}
+
 /// Simulates mouse input using CGEvent
 final class MouseController: @unchecked Sendable {
   static let shared = MouseController()
@@ -60,7 +81,7 @@ final class MouseController: @unchecked Sendable {
 
     guard
       let mouseDown = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: SharedEventSource.source,
         mouseType: mouseDownType,
         mouseCursorPosition: point,
         mouseButton: mouseButton
@@ -71,7 +92,7 @@ final class MouseController: @unchecked Sendable {
 
     guard
       let mouseUp = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: SharedEventSource.source,
         mouseType: mouseUpType,
         mouseCursorPosition: point,
         mouseButton: mouseButton
@@ -80,35 +101,28 @@ final class MouseController: @unchecked Sendable {
       return .fail("Failed to create mouse up event")
     }
 
-    // Set click count for double/triple clicks
     mouseDown.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
     mouseUp.setIntegerValueField(.mouseEventClickState, value: Int64(clickCount))
 
-    // Post the events
     mouseDown.post(tap: .cghidEventTap)
     mouseUp.post(tap: .cghidEventTap)
 
     return .ok()
   }
 
-  /// Double-click at the specified screen coordinates
   func doubleClick(at point: CGPoint, button: MouseButton = .left) -> InputResult {
-    // First click
     let result1 = click(at: point, button: button, clickCount: 1)
     if !result1.success { return result1 }
 
-    // Small delay
     Thread.sleep(forTimeInterval: 0.05)
 
-    // Second click with clickCount = 2
     return click(at: point, button: button, clickCount: 2)
   }
 
-  /// Move the mouse to the specified screen coordinates
   func moveTo(_ point: CGPoint) -> InputResult {
     guard
       let event = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: SharedEventSource.source,
         mouseType: .mouseMoved,
         mouseCursorPosition: point,
         mouseButton: .left
@@ -121,7 +135,6 @@ final class MouseController: @unchecked Sendable {
     return .ok()
   }
 
-  /// Scroll in the specified direction
   func scroll(direction: ScrollDirection, amount: Int32 = 3) -> InputResult {
     let deltaX: Int32
     let deltaY: Int32
@@ -143,7 +156,7 @@ final class MouseController: @unchecked Sendable {
 
     guard
       let event = CGEvent(
-        scrollWheelEvent2Source: nil,
+        scrollWheelEvent2Source: SharedEventSource.source,
         units: .pixel,
         wheelCount: 2,
         wheel1: deltaY,
@@ -158,7 +171,13 @@ final class MouseController: @unchecked Sendable {
     return .ok()
   }
 
-  /// Drag from one point to another
+  /// Drag from one point to another.
+  ///
+  /// CRITICAL: drag is treated as an uninterruptible critical section. If we
+  /// posted a mouseDown but failed to post the matching mouseUp, the OS would
+  /// believe the mouse button is still held down and every subsequent user
+  /// click would drag things around. The `defer` ensures the final mouseUp
+  /// fires on every exit path.
   func drag(from start: CGPoint, to end: CGPoint, button: MouseButton = .left) -> InputResult {
     let mouseDownType: CGEventType
     let mouseDragType: CGEventType
@@ -183,10 +202,9 @@ final class MouseController: @unchecked Sendable {
       mouseButton = .center
     }
 
-    // Mouse down at start
     guard
       let mouseDown = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: SharedEventSource.source,
         mouseType: mouseDownType,
         mouseCursorPosition: start,
         mouseButton: mouseButton
@@ -196,13 +214,28 @@ final class MouseController: @unchecked Sendable {
     }
     mouseDown.post(tap: .cghidEventTap)
 
-    // Small delay
+    // Always release the button, even on error. This is the critical safety:
+    // without it a stray failure would leave the OS believing the user is
+    // still holding the mouse button down.
+    var releaseFired = false
+    defer {
+      if !releaseFired,
+        let release = CGEvent(
+          mouseEventSource: SharedEventSource.source,
+          mouseType: mouseUpType,
+          mouseCursorPosition: end,
+          mouseButton: mouseButton
+        )
+      {
+        release.post(tap: .cghidEventTap)
+      }
+    }
+
     Thread.sleep(forTimeInterval: 0.05)
 
-    // Drag to end
     guard
       let mouseDrag = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: SharedEventSource.source,
         mouseType: mouseDragType,
         mouseCursorPosition: end,
         mouseButton: mouseButton
@@ -212,13 +245,11 @@ final class MouseController: @unchecked Sendable {
     }
     mouseDrag.post(tap: .cghidEventTap)
 
-    // Small delay
     Thread.sleep(forTimeInterval: 0.05)
 
-    // Mouse up at end
     guard
       let mouseUp = CGEvent(
-        mouseEventSource: nil,
+        mouseEventSource: SharedEventSource.source,
         mouseType: mouseUpType,
         mouseCursorPosition: end,
         mouseButton: mouseButton
@@ -227,6 +258,7 @@ final class MouseController: @unchecked Sendable {
       return .fail("Failed to create mouse up event")
     }
     mouseUp.post(tap: .cghidEventTap)
+    releaseFired = true
 
     return .ok()
   }
@@ -238,15 +270,35 @@ final class MouseController: @unchecked Sendable {
 final class KeyboardController: @unchecked Sendable {
   static let shared = KeyboardController()
 
+  /// Strings longer than this trigger the "loose suppression" path so the user
+  /// isn't locked out of their keyboard for the duration of a long paste.
+  private static let longTypeThreshold: Int = 100
+
   private init() {}
 
-  /// Type a string of text
+  /// Type a string of text. Long strings (>100 chars) temporarily disable the
+  /// shared event source's input suppression so the user isn't frozen for the
+  /// entire paste duration; Esc-cancellation still works via the per-character
+  /// check below.
   func type(text: String) -> InputResult {
+    let isLong = text.count > Self.longTypeThreshold
+    let originalSuppression = SharedEventSource.source.localEventsSuppressionInterval
+    if isLong {
+      SharedEventSource.setSuppression(0.0)
+    }
+    defer {
+      if isLong {
+        SharedEventSource.setSuppression(originalSuppression)
+      }
+    }
+
     for char in text {
+      if AutomationSession.shared.isCancelled() {
+        return .fail("Cancelled by user (Esc was pressed).")
+      }
       if let result = typeCharacter(char), !result.success {
         return result
       }
-      // Small delay between characters for reliability
       Thread.sleep(forTimeInterval: 0.01)
     }
     return .ok()
@@ -255,14 +307,15 @@ final class KeyboardController: @unchecked Sendable {
   private func typeCharacter(_ char: Character) -> InputResult? {
     let str = String(char)
 
-    // Use CGEvent to type Unicode characters
-    guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-      let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+    guard
+      let keyDown = CGEvent(
+        keyboardEventSource: SharedEventSource.source, virtualKey: 0, keyDown: true),
+      let keyUp = CGEvent(
+        keyboardEventSource: SharedEventSource.source, virtualKey: 0, keyDown: false)
     else {
       return .fail("Failed to create keyboard event")
     }
 
-    // Set the Unicode string
     var unicodeString = Array(str.utf16)
     keyDown.keyboardSetUnicodeString(
       stringLength: unicodeString.count, unicodeString: &unicodeString)
@@ -271,7 +324,7 @@ final class KeyboardController: @unchecked Sendable {
     keyDown.post(tap: .cghidEventTap)
     keyUp.post(tap: .cghidEventTap)
 
-    return nil  // Success, continue typing
+    return nil
   }
 
   /// Press a specific key with optional modifiers
@@ -280,8 +333,11 @@ final class KeyboardController: @unchecked Sendable {
       return .fail("Unknown key: \(keyName)")
     }
 
-    guard let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
-      let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
+    guard
+      let keyDown = CGEvent(
+        keyboardEventSource: SharedEventSource.source, virtualKey: keyCode, keyDown: true),
+      let keyUp = CGEvent(
+        keyboardEventSource: SharedEventSource.source, virtualKey: keyCode, keyDown: false)
     else {
       return .fail("Failed to create keyboard event")
     }
@@ -299,7 +355,6 @@ final class KeyboardController: @unchecked Sendable {
   private func keyCodeForName(_ name: String) -> CGKeyCode? {
     let lowerName = name.lowercased()
 
-    // Special keys
     let specialKeys: [String: CGKeyCode] = [
       "return": 0x24,
       "enter": 0x24,
@@ -353,7 +408,6 @@ final class KeyboardController: @unchecked Sendable {
       return code
     }
 
-    // Letter keys (a-z)
     let letterKeys: [String: CGKeyCode] = [
       "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04,
       "g": 0x05, "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09,

@@ -82,6 +82,11 @@ struct ScreenshotOptions: Decodable {
 
   /// If specified, save screenshot to this file path instead of returning base64
   var savePath: String?
+
+  /// If true, overlay element IDs from the most recent snapshot (matched by pid).
+  /// Useful for vision-augmented agents to reference IDs straight from the image.
+  /// Requires `pid` to be set, and that get_ui_elements has been called for that pid.
+  var annotate: Bool?
 }
 
 // MARK: - Display Info
@@ -155,17 +160,31 @@ final class ScreenshotController: @unchecked Sendable {
       return .fail("Failed to capture screenshot")
     }
 
+    // Optionally annotate with element IDs before scaling so labels stay legible.
+    let annotatedImage: CGImage = {
+      if options.annotate == true, let pid = options.pid {
+        let elements = AccessibilityManager.shared.mostRecentElements(for: pid)
+        if let captureBounds = captureBoundsForPid(pid),
+          let overlaid = overlayElementIds(
+            on: cgImage, elements: elements, captureOrigin: captureBounds.origin)
+        {
+          return overlaid
+        }
+      }
+      return cgImage
+    }()
+
     // Apply scaling - default to 0.5 for reasonable size on Retina displays
     let finalImage: CGImage
     let scale = options.scale ?? 0.5
     if scale > 0 && scale < 1.0 {
-      if let scaled = scaleImage(cgImage, scale: scale) {
+      if let scaled = scaleImage(annotatedImage, scale: scale) {
         finalImage = scaled
       } else {
-        finalImage = cgImage
+        finalImage = annotatedImage
       }
     } else {
-      finalImage = cgImage
+      finalImage = annotatedImage
     }
 
     // Convert to data - default to JPEG for much smaller file size
@@ -377,4 +396,109 @@ final class ScreenshotController: @unchecked Sendable {
       return bitmapRep.representation(using: .png, properties: [:])
     }
   }
+
+  /// Compute the screen-space bounds of the captured region so we can map
+  /// AX (global) coordinates to image-local coordinates.
+  /// Returns nil if we can't determine bounds; callers should skip annotation.
+  fileprivate func captureBoundsForPid(_ pid: Int32) -> CGRect? {
+    let windowList =
+      CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+      as? [[CFString: Any]]
+    guard let windows = windowList else { return nil }
+
+    for window in windows {
+      if let windowPID = window[kCGWindowOwnerPID] as? Int32, windowPID == pid,
+        let bounds = window[kCGWindowBounds] as? [String: Any],
+        let x = bounds["X"] as? Double,
+        let y = bounds["Y"] as? Double,
+        let w = bounds["Width"] as? Double,
+        let h = bounds["Height"] as? Double,
+        w > 100, h > 100
+      {
+        return CGRect(x: x, y: y, width: w, height: h)
+      }
+    }
+    return nil
+  }
+}
+
+// MARK: - Annotation Overlay
+
+/// Draws element-ID labels on top of `image` so vision-capable agents can
+/// reference IDs visually. `captureOrigin` is the screen-space origin of the
+/// capture so we can subtract it from each element's global AX coordinates.
+private func overlayElementIds(
+  on image: CGImage,
+  elements: [(id: String, frame: CGRect)],
+  captureOrigin: CGPoint
+) -> CGImage? {
+  let width = image.width
+  let height = image.height
+  guard width > 0, height > 0, !elements.isEmpty else { return image }
+
+  guard
+    let context = CGContext(
+      data: nil,
+      width: width,
+      height: height,
+      bitsPerComponent: 8,
+      bytesPerRow: 0,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )
+  else { return nil }
+
+  // Draw original image
+  context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+  // Set up colors: red boxes, white text on red
+  let boxStroke = CGColor(red: 1.0, green: 0.1, blue: 0.1, alpha: 0.95)
+  let labelFill = CGColor(red: 1.0, green: 0.1, blue: 0.1, alpha: 0.85)
+  context.setStrokeColor(boxStroke)
+  context.setLineWidth(1.5)
+
+  let nsContext = NSGraphicsContext(cgContext: context, flipped: false)
+  NSGraphicsContext.saveGraphicsState()
+  NSGraphicsContext.current = nsContext
+
+  let font = NSFont.boldSystemFont(ofSize: 11)
+  let textAttrs: [NSAttributedString.Key: Any] = [
+    .font: font,
+    .foregroundColor: NSColor.white,
+  ]
+
+  for element in elements {
+    let f = element.frame
+    // Convert global top-left coords to image-local coords.
+    // CGContext is bottom-left origin; flip y.
+    let localX = f.origin.x - captureOrigin.x
+    let localTopY = f.origin.y - captureOrigin.y
+    let bottomY = CGFloat(height) - localTopY - f.size.height
+    let rect = CGRect(x: localX, y: bottomY, width: f.size.width, height: f.size.height)
+    if rect.maxX <= 0 || rect.maxY <= 0 || rect.minX >= CGFloat(width)
+      || rect.minY >= CGFloat(height)
+    {
+      continue
+    }
+
+    context.stroke(rect)
+
+    // Draw a small label in the top-left of the element with the id
+    let labelText = element.id
+    let attributed = NSAttributedString(string: labelText, attributes: textAttrs)
+    let textSize = attributed.size()
+    let pad: CGFloat = 2
+    let labelRect = CGRect(
+      x: rect.minX,
+      y: rect.maxY - textSize.height - pad * 2,
+      width: textSize.width + pad * 2,
+      height: textSize.height + pad * 2
+    )
+    context.setFillColor(labelFill)
+    context.fill(labelRect)
+    attributed.draw(at: CGPoint(x: labelRect.minX + pad, y: labelRect.minY + pad))
+  }
+
+  NSGraphicsContext.restoreGraphicsState()
+  return context.makeImage()
 }

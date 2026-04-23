@@ -3,413 +3,130 @@ name: osaurus-macos-use
 description: Control macOS via accessibility APIs. Use when the user asks to interact with native Mac apps, automate UI tasks, browse the web in Safari, fill forms, navigate menus, or perform any on-screen action.
 metadata:
   author: osaurus
-  version: "0.2.0"
+  version: "0.3.1"
 ---
 
 # Osaurus macOS Use
 
-Automate macOS through accessibility APIs. This plugin gives you direct control over any application's UI — click buttons, type text, fill forms, navigate menus, browse the web in Safari, and more.
+Automate macOS through the accessibility tree: open apps, observe the UI, click buttons, type into fields, navigate menus, browse the web.
 
-## Core Workflow
+## The Contract
 
-Every interaction follows the **Open-Observe-Act** pattern:
+Four rules. Follow them in order, every time.
 
-1. **Open the app** — `open_application` to launch/activate, returns a `pid`.
-2. **Observe the UI** — ALWAYS call `get_ui_elements` with the `pid` before doing anything else. This confirms the app is ready and gives you element IDs. **Never skip this step. Never send keyboard or mouse actions before observing.**
-3. **Act** — use element IDs to `click_element`, `type_text`, `set_value`, `press_key`, etc.
-4. **Re-observe when the UI changes** — after navigation, dialogs, tab switches, or form submissions. Do NOT re-observe after actions that don't change the visible UI (typing, toggling, pressing shortcuts).
+1. **Open** with `open_application`. It returns the app `pid` AND a starting `snapshot`. **Read the snapshot before doing anything else** — never send input to a freshly opened app without it.
+2. **Locate** with `find_elements({ pid, text, role? })` whenever you know what you're looking for. It is faster, cheaper, and more reliable than scanning a `get_ui_elements` result by hand.
+3. **Act** with `click_element`, `set_value`, `type_text`, `clear_field`, `press_key`. Always pass element ids in the `s{snapshot}-{n}` format (e.g. `"s7-12"`) returned by step 1 or 2.
+4. **Re-observe** only when the result tells you to:
+   - `"stale": true` → call `get_ui_elements` (or `find_elements`) again, then retry.
+   - `"removed": true` → element is gone; observe and find a new one.
+   - `delta.focusedWindow` changed in a way you didn't expect → observe again.
+   - Otherwise (typing into a focused field, toggling a checkbox, pressing a shortcut) → keep going.
 
-This decoupled approach keeps token usage low. A typical 5-step interaction costs ~3K tokens vs ~150K if you re-observed after every action.
+If you'd rather not think about re-observing at all, use `act_and_observe` — it runs an action and returns a fresh snapshot in one call.
 
-## When to Re-Observe
+## Multi-step flows for non-technical users
 
-Call `get_ui_elements` again when:
-- You clicked a button/link that opens a new view, dialog, page, or menu
-- You switched tabs or windows
-- You submitted a form and the UI refreshed
-- An element ID returns "Element not found"
+When the user is watching (configuring macOS, helping an elderly user, walking through anything more than 1-2 actions), do this:
 
-Do NOT re-observe when:
-- You just typed text into a field (the field still has focus)
-- You just pressed a keyboard shortcut (e.g., Cmd+S to save)
-- You clicked a toggle, checkbox, or other control that doesn't change the surrounding UI
+1. Call `start_automation_session({ title, totalSteps? })` first. The user sees a floating HUD that says "Automation in progress" with your title. They can press **Esc** at any time to stop you.
+2. On every action call, pass a short **`narration`** string in plain language: `click_element({ id: "s2-3", narration: "Clicking 'Continue'" })`. The HUD updates so the user can follow along.
+3. Optionally call `update_automation_session({ stepIndex: 3 })` to advance the "Step 3 of 7" progress.
+4. Call `end_automation_session({ reason: "complete" })` when you're done. (Idle sessions auto-end after ~3s, so this is optional but cleaner.)
 
-## Tool Selection Guide
+Every action result includes `cancelled: true` if the user pressed Esc. **When you see that, stop immediately and tell the user the automation was cancelled.** Don't retry, don't keep going.
 
-### Clicking
+The HUD also appears automatically the first time any tool is called, even if you forget `start_automation_session` — but a real title and per-step narration is much better than the generic default.
 
-- **`click_element`** — Default choice. Uses accessibility actions (most reliable). Supports `button: "right"` for context menus and `doubleClick: true` for double-clicks.
-- **`click`** — Fallback for coordinate-based clicks. Only use when elements aren't accessible (canvas apps, image regions, screenshot-guided interaction).
-
-### Entering Text
-
-- **`set_value`** — Best for form fields. Directly sets the element's value. Instant, reliable, replaces existing content.
-- **`type_text`** — Simulates keystroke-by-keystroke typing. Use when `set_value` doesn't work (e.g., search fields that need live filtering, password fields, or fields that trigger on-type events). Pass `id` to auto-focus the element first.
-
-Prefer `set_value` over `type_text` when filling forms. Fall back to `type_text` if `set_value` returns an error.
-
-### Screenshots
-
-- **`take_screenshot`** — Use when the accessibility tree is insufficient to understand the visual layout (e.g., verifying styling, reading images, canvas apps, or when elements don't have labels).
-- **`get_ui_elements`** — Preferred for most interactions. Lighter, faster, and returns structured data.
-
-Use `take_screenshot` with `pid` to capture a specific app window. Default settings (JPEG, 0.7 quality, 0.5 scale) are optimized for token efficiency.
-
-### Keyboard
-
-- **`press_key`** — For keyboard shortcuts, navigation keys, and special keys. Always prefer keyboard shortcuts over UI clicking when available (faster, more reliable).
-
-### Scrolling
-
-- **`scroll`** — Pass `x`/`y` to scroll a specific area. Without coordinates, scrolls at the current mouse position. Use `amount` to control scroll distance (default: 3 pixels).
-
-## Token Efficiency Tips
-
-1. **Use `interactiveOnly: true`** (default) when calling `get_ui_elements`. Only set to `false` when you need to read static text labels.
-2. **Keep `maxElements` low.** Default is 100. For simple UIs (dialogs, settings panes), use 30-50. For complex UIs (web pages), use 100-150.
-3. **Use `roles` filter** to narrow results. For example, `roles: ["button"]` when looking for a specific button, or `roles: ["textField", "textArea"]` when looking for input fields.
-4. **Avoid unnecessary screenshots.** Screenshots consume vision tokens. Use `get_ui_elements` first — only screenshot if you need visual context.
-5. **Batch actions between observations.** After the initial observe, perform multiple actions (click, type, press key) before re-observing — but always do that initial observe after `open_application`.
-6. **Use keyboard shortcuts** instead of navigating menus. `press_key("s", modifiers: ["command"])` is cheaper than finding and clicking File > Save.
-
-## Common Recipes
-
-### Open an App and Inspect It
-
-Always observe after opening — never skip this step:
+## Canonical Recipe
 
 ```
-1. open_application(identifier: "Notes")
-   → { pid: 1234, name: "Notes" }
+1. start_automation_session({ title: "Visiting example.com", totalSteps: 6 })
 
-2. get_ui_elements(pid: 1234)
-   → Returns elements with IDs — app is confirmed ready
-```
+2. open_application({ identifier: "Safari", narration: "Opening Safari" })
+   → { pid: 1234, name: "Safari", snapshot: { snapshotId: 1, windows: [...], elements: [...] } }
 
-### Click a Button
+3. press_key({ key: "l", modifiers: ["command"], pid: 1234, narration: "Focusing the address bar" })
+   → { success: true, delta: { focusedElement: { role: "textfield", label: "Address" } } }
 
-After observing (step 2 above), find the element and click it:
-
-```
-click_element(id: 5)
-→ { success: true }
-```
-
-### Fill a Text Field
-
-Use `roles` to filter for input fields, then set the value:
-
-```
-1. get_ui_elements(pid: 1234, roles: ["textField", "searchField"])
-   → Find text field with ID = 8
-
-2. set_value(id: 8, value: "Hello, world!")
+4. type_text({ text: "https://example.com", narration: "Entering the URL" })
    → { success: true }
+
+5. press_key({ key: "return", pid: 1234, narration: "Loading the page" })
+   → { success: true, delta: { focusedWindow: "Example Domain" } }
+
+6. find_elements({ pid: 1234, text: "More information", role: "link" })
+   → { snapshotId: 2, elements: [{ id: "s2-3", role: "link", label: "More information..." }] }
+
+7. click_element({ id: "s2-3", narration: "Following the 'More information' link" })
+   → { success: true, delta: { focusedWindow: "IANA-managed Reserved Domains" } }
+
+8. end_automation_session({ reason: "complete" })
 ```
 
-If `set_value` fails, fall back to `type_text`:
+Token cost for this whole flow: ~3-5K. Compare to ~150K if you observed the entire tree after every step.
 
-```
-type_text(text: "Hello, world!", id: 8)
-→ { success: true }
-```
+## Snapshot Ids and the Cache
 
-### Navigate a Menu
+- Element ids look like `s7-12`. The `s7` is the snapshot they came from.
+- The plugin keeps the **last 2 snapshots** in cache. Ids from older snapshots return `"stale": true`.
+- Each call to `get_ui_elements`, `find_elements`, or `open_application` (with default `observe: true`) **starts a new snapshot** and bumps the counter.
+- This means: if you call `find_elements` twice in a row, the ids from the first call become stale on the third call, not the second.
 
-Use keyboard shortcuts when possible. Otherwise:
-
-```
-1. click_element(id: <menu_bar_item_id>)
-   → Opens menu
-
-2. get_ui_elements(pid: 1234, roles: ["menuItem"])
-   → Find the menu item
-
-3. click_element(id: <menu_item_id>)
-```
-
-### Right-Click for Context Menu
-
-```
-1. click_element(id: 5, button: "right")
-   → Opens context menu
-
-2. get_ui_elements(pid: 1234, roles: ["menuItem"])
-   → Find context menu items
-
-3. click_element(id: <menu_item_id>)
-```
-
-### Handle a Dialog
-
-After an action triggers a dialog:
-
-```
-1. get_ui_elements(pid: 1234)
-   → Dialog elements appear (buttons like "OK", "Cancel", "Save")
-
-2. click_element(id: <ok_button_id>)
-```
-
-### Switch Between Apps
-
-```
-1. open_application(identifier: "Safari")
-   → { pid: 5678 }
-
-2. get_ui_elements(pid: 5678)
-   → Safari's UI elements — now safe to interact
-```
-
-You can also use `press_key("tab", modifiers: ["command"])` to switch, but always follow up with `get_ui_elements` before sending any input to the newly focused app.
-
-## Safari Web Browsing
-
-Safari's web content is fully accessible through the accessibility tree. Links, buttons, headings, text fields, and other interactive elements all appear in `get_ui_elements`.
-
-### Navigate to a URL
-
-```
-1. open_application(identifier: "Safari")
-   → { pid: 5678 }
-
-2. get_ui_elements(pid: 5678)
-   → Confirm Safari is loaded and ready
-
-3. press_key("l", modifiers: ["command"])
-   → Focuses the address bar
-
-4. type_text(text: "https://example.com")
-
-5. press_key("return")
-   → Page loads
-
-6. get_ui_elements(pid: 5678)
-   → Web page elements (links, buttons, inputs)
-```
-
-### Click a Link on a Web Page
-
-Once Safari is open and observed:
-
-```
-1. click_element(id: 12)
-   → Navigates to sign-in page (ID 12 was "Sign In" link from observation)
-
-2. get_ui_elements(pid: 5678)
-   → New page elements (re-observe because the page changed)
-```
-
-### Fill a Web Form
-
-After navigating to a page with a form:
-
-```
-1. get_ui_elements(pid: 5678, roles: ["textField"])
-   → Find email field ID = 15, password field ID = 16
-
-2. set_value(id: 15, value: "user@example.com")
-3. set_value(id: 16, value: "password123")
-4. click_element(id: <submit_button_id>)
-```
-
-### Search the Web
-
-Assumes Safari is already open and observed (you have the `pid`):
-
-```
-1. press_key("l", modifiers: ["command"])
-2. type_text(text: "weather in San Francisco")
-3. press_key("return")
-4. get_ui_elements(pid: 5678)
-   → Search results page elements
-```
-
-### Tab Management
-
-- **New tab:** `press_key("t", modifiers: ["command"])`
-- **Close tab:** `press_key("w", modifiers: ["command"])`
-- **Next tab:** `press_key("}", modifiers: ["command", "shift"])`
-- **Previous tab:** `press_key("{", modifiers: ["command", "shift"])`
-- **Reopen closed tab:** `press_key("z", modifiers: ["command", "shift"])`
-
-### Reading Page Content
-
-Use `get_ui_elements` with `interactiveOnly: false` to read static text on a page. If the page layout matters, use `take_screenshot` to visually inspect it.
-
-### Scrolling a Web Page
-
-```
-scroll(direction: "down", amount: 5, x: 700, y: 400)
-```
-
-Pass the center of the Safari content area as `x`/`y` to ensure scrolling happens in the right place.
-
-## macOS Keyboard Shortcuts
-
-Use these with `press_key` to avoid navigating menus:
-
-### System
-
-| Action | Key | Modifiers |
-|---|---|---|
-| Switch app | `tab` | `["command"]` |
-| Spotlight search | `space` | `["command"]` |
-| Force quit | `escape` | `["command", "option"]` |
-| Lock screen | `q` | `["command", "control"]` |
-| Screenshot (clipboard) | `3` | `["command", "shift"]` |
-| Screenshot (selection) | `4` | `["command", "shift"]` |
-
-### File Operations
-
-| Action | Key | Modifiers |
-|---|---|---|
-| Save | `s` | `["command"]` |
-| Save As | `s` | `["command", "shift"]` |
-| Open | `o` | `["command"]` |
-| New | `n` | `["command"]` |
-| Close window | `w` | `["command"]` |
-| Quit app | `q` | `["command"]` |
-| Print | `p` | `["command"]` |
-
-### Editing
-
-| Action | Key | Modifiers |
-|---|---|---|
-| Copy | `c` | `["command"]` |
-| Cut | `x` | `["command"]` |
-| Paste | `v` | `["command"]` |
-| Undo | `z` | `["command"]` |
-| Redo | `z` | `["command", "shift"]` |
-| Select all | `a` | `["command"]` |
-| Find | `f` | `["command"]` |
-| Find next | `g` | `["command"]` |
-
-### Safari
-
-| Action | Key | Modifiers |
-|---|---|---|
-| Focus address bar | `l` | `["command"]` |
-| New tab | `t` | `["command"]` |
-| Close tab | `w` | `["command"]` |
-| Reload | `r` | `["command"]` |
-| Back | `[` | `["command"]` |
-| Forward | `]` | `["command"]` |
-| Downloads | `l` | `["command", "option"]` |
-| Bookmarks | `b` | `["command", "option"]` |
-| Reader mode | `r` | `["command", "shift"]` |
-
-### Navigation
-
-| Action | Key | Modifiers |
-|---|---|---|
-| Next field | `tab` | |
-| Previous field | `tab` | `["shift"]` |
-| Confirm/submit | `return` | |
-| Cancel/dismiss | `escape` | |
-| Page up | `pageup` | |
-| Page down | `pagedown` | |
-| Top of page | `home` | |
-| Bottom of page | `end` | |
+If you ever see a result with `"stale": true`, the fix is always the same: re-observe and retry with the new id.
 
 ## Tool Reference
 
-### `open_application`
+| Tool | When to use |
+|---|---|
+| `open_application` | First step. Opens/activates an app and returns an initial snapshot. |
+| `get_ui_elements` | Full snapshot of an app's UI. Use after navigation if `find_elements` isn't specific enough. Defaults: 150 elements, depth 20, interactive only. Set `focusedWindowOnly: true` for a cheap re-observation. |
+| `find_elements` | Server-side search by `text` and/or `role`. Default `limit: 10`. **Prefer this over `get_ui_elements` whenever you know what you're looking for.** |
+| `get_active_window` | Discover the frontmost app's pid when you don't have one. |
+| `click_element` | Click by snapshot id. `button: "right"` and `doubleClick: true` supported. |
+| `set_value` | Replace a field's value instantly. Best for forms. |
+| `clear_field` | Empty a text field. Use before `type_text` if you want to replace, not append. |
+| `type_text` | Keystroke-by-keystroke typing. Pass `id` to focus first; `replace: true` (default) clears the field first. |
+| `press_key` | Keyboard shortcuts and special keys. Pass `pid` to get a focus delta back. |
+| `scroll` | Pass `x`/`y` to position the mouse first if scrolling a specific area. |
+| `drag` | Coordinate-based drag for sliders, window resize, drag-and-drop. |
+| `click` | Last-resort coordinate click. Use only when an element isn't accessible (canvas apps). |
+| `act_and_observe` | Run any element action AND get a fresh snapshot in one call. Use when you'd otherwise have to re-observe immediately. |
+| `take_screenshot` | When the AX tree isn't enough (visual layout, images, canvas). Set `annotate: true` with `pid` to overlay element ids on the image. |
+| `list_displays` | Multi-monitor setups only. |
+| `start_automation_session` | Show the HUD with a title and (optional) step count. Strongly recommended for any flow >2 actions. |
+| `update_automation_session` | Change the HUD's title, narration, or step counter outside of an action call. |
+| `end_automation_session` | Hide the HUD and reset state when the flow is done. |
 
-- Accepts app name (`"Safari"`), bundle ID (`"com.apple.Safari"`), or file path.
-- If already running, activates the app. Otherwise launches it.
-- Returns `pid`, `bundleId`, and `name`.
+## Tips That Actually Matter
 
-### `get_ui_elements`
-
-- Returns interactive elements with assigned IDs. Each element has: `id`, `role`, `label`, `value`, `x`, `y`, `w`, `h`, `actions`.
-- IDs are valid until the next `get_ui_elements` call (which resets the cache).
-- Use `roles` filter for targeted queries: `["button"]`, `["textField", "textArea"]`, `["link"]`, `["menuItem"]`, etc.
-- Common roles: `button`, `link`, `textField`, `textArea`, `checkBox`, `radioButton`, `popUpButton`, `comboBox`, `slider`, `menuItem`, `tab`, `searchField`.
-
-### `click_element`
-
-- Left-click by default. Pass `button: "right"` for right-click. Pass `doubleClick: true` for double-click.
-- Uses AXPress action first (most reliable), falls back to coordinate click.
-- Returns `{ success: true }` or `{ success: false, error: "..." }`.
-
-### `click`
-
-- Clicks at raw screen coordinates. Only use when elements aren't accessible.
-- Supports `button` (left/right/center) and `doubleClick`.
-
-### `type_text`
-
-- Types keystroke-by-keystroke into the focused element.
-- Pass `id` to auto-focus an element before typing.
-- Use for search fields, password fields, or fields that need on-type events.
-
-### `set_value`
-
-- Directly sets an element's value via accessibility API.
-- Preferred over `type_text` for form fields — instant and replaces existing content.
-- Returns error if the element isn't editable.
-
-### `press_key`
-
-- Key names: `return`, `escape`, `tab`, `delete`, `space`, `up`, `down`, `left`, `right`, `f1`-`f12`, `home`, `end`, `pageup`, `pagedown`, or single characters (`a`, `1`, `,`, etc.).
-- Modifier names: `command`, `shift`, `option`, `control`.
-
-### `scroll`
-
-- Directions: `up`, `down`, `left`, `right`.
-- `amount` controls scroll distance in pixels (default: 3). Use higher values (5-10) for faster scrolling.
-- Pass `x`/`y` to position the mouse before scrolling (important for scrolling specific areas).
-
-### `drag`
-
-- Drags from (`startX`, `startY`) to (`endX`, `endY`).
-- Useful for sliders, window resizing, drag-and-drop, and drawing.
-
-### `take_screenshot`
-
-- Defaults: JPEG format, 0.7 quality, 0.5 scale.
-- Pass `pid` to capture a specific app's window.
-- Pass `savePath` to save to disk (avoids base64 token costs).
-- Returns MCP ImageContent format for vision model consumption.
-
-### `get_active_window`
-
-- Returns: `pid`, `app` name, `title`, `x`, `y`, `w`, `h`.
-- Useful when you don't know which app is in front.
-
-### `list_displays`
-
-- Returns all connected displays with index, position, and dimensions.
-- Only needed for multi-monitor setups.
+1. **Always pass `pid` to `press_key`** when you care whether it changed the focused window/element. The returned `delta` saves you a snapshot.
+2. **`set_value` first, `type_text` if it fails.** `set_value` is instant and correct for most fields. Fall back to `type_text` (which focuses + clears + types) for search fields, password fields, or anything that needs per-keystroke events.
+3. **Check `truncated: true` in any snapshot.** If true, raise `maxElements` or use `find_elements` instead of `get_ui_elements`.
+4. **`focusedWindowOnly: true` is your friend.** Cheap re-observation when you know the action only affected the focused window.
+5. **Keyboard shortcuts beat menu navigation.** `press_key("s", modifiers: ["command"])` is one tool call; clicking File > Save is three.
+6. **Roles can be passed in any case.** `"button"`, `"Button"`, and `"AXButton"` all work in `find_elements({ role })` and `get_ui_elements({ roles })`.
 
 ## Troubleshooting
 
-### "Element not found"
+| Symptom | Fix |
+|---|---|
+| `"stale": true` | Re-observe (any of `get_ui_elements`, `find_elements`, `open_application`) and retry with the fresh id. |
+| `"removed": true` | The element is gone from the UI. Re-observe and find a new one. |
+| `"cancelled": true` | User pressed Esc. **Stop**, tell the user the automation was cancelled. Do not retry. |
+| `error` mentions "not a valid snapshot id" | You passed a v0.2 integer id. Use the `s{n}-{n}` strings returned by the new tools. |
+| Empty `elements: []` from `get_ui_elements` | Check `truncated`; lower `maxDepth`; broaden `interactiveOnly: false`; or use `find_elements`. |
+| `set_value` returns "not editable" | Fall back to `type_text` with the element id (auto-focuses and replaces). |
+| App won't open / wrong app focused | Try the bundle id (`com.apple.Safari`) instead of name. Use `get_active_window` to confirm. |
+| No elements at all | The host app needs Accessibility permission in System Settings > Privacy & Security > Accessibility. |
 
-The element cache was reset or the element is no longer on screen. Call `get_ui_elements` again to refresh.
+## Reference
 
-### "Failed to set element value"
-
-The element may not be editable via accessibility. Fall back to `type_text` with the element `id`.
-
-### No elements returned
-
-- Verify the `pid` is correct (use `get_active_window` to check).
-- Some apps have poor accessibility support. Try `take_screenshot` and use coordinate-based `click` instead.
-- For web content in Safari, ensure the page has fully loaded before querying elements.
-
-### Stale element positions
-
-Elements may move after window resize or scroll. Call `get_ui_elements` again if coordinate-based fallback clicks miss.
-
-### Accessibility permission denied
-
-The host application needs Accessibility permission in System Settings > Privacy & Security > Accessibility.
+For per-app recipes (Safari URL bar, web forms, tab management) and the full keyboard shortcut catalog, see [REFERENCE.md](REFERENCE.md). Don't load it unless you need it — most automation only needs the contract above.
 
 ## Limitations
 
-- **Canvas-based apps** (Figma, games) — No element tree. Use `take_screenshot` + `click` with coordinates.
-- **Poorly accessible apps** — Some apps don't expose their UI through accessibility APIs. Use screenshot-guided coordinate clicks as fallback.
-- **Complex web apps** — Very dynamic SPAs may have elements that appear/disappear rapidly. Re-observe frequently and use shorter `maxElements`.
-- **Element modification** — Cannot reorder, resize, or restyle UI elements. This plugin observes and interacts with the existing UI.
+- **Canvas apps** (Figma, games): no element tree. Use `take_screenshot` + `click` with coordinates.
+- **Poorly accessible apps** (some Electron / older apps): fall back to coordinate clicks.
+- **Highly dynamic web apps**: re-observe more often; prefer `find_elements` over caching ids across navigation.
+- **Iframes / web in non-Safari browsers**: AX coverage varies; Safari is most reliable.
