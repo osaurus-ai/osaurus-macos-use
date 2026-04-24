@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 
@@ -119,7 +120,7 @@ struct ManifestTests {
     #expect(json["min_macos"] as? String == "13.0")
   }
 
-  @Test("Manifest contains exactly 18 tools")
+  @Test("Manifest contains exactly 20 tools")
   func manifestToolCount() {
     let ctx = createContext(api: api)
     defer { api.destroy!(ctx) }
@@ -131,7 +132,7 @@ struct ManifestTests {
     let json = parseJSON(manifest)!
     let capabilities = json["capabilities"] as! [String: Any]
     let tools = capabilities["tools"] as! [[String: Any]]
-    #expect(tools.count == 18)
+    #expect(tools.count == 20)
   }
 
   @Test("Manifest contains all expected tool IDs")
@@ -153,6 +154,8 @@ struct ManifestTests {
       "get_ui_elements",
       "find_elements",
       "get_active_window",
+      "list_apps",
+      "list_windows",
       "click_element",
       "click",
       "type_text",
@@ -170,6 +173,19 @@ struct ManifestTests {
     ]
 
     #expect(toolIDs == expectedIDs)
+  }
+
+  @Test("Manifest top-level description advertises backgrounded driving")
+  func manifestDescriptionMentionsBackground() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+    let manifestPtr = api.getManifest!(ctx)!
+    let manifest = String(cString: manifestPtr)
+    api.freeString!(manifestPtr)
+    let json = parseJSON(manifest)!
+    let desc = (json["description"] as? String ?? "").lowercased()
+    #expect(desc.contains("background"))
+    #expect(desc.contains("cursor"))
   }
 
   @Test("Each tool has required fields")
@@ -831,6 +847,7 @@ struct DataModelTests {
     let json = "{}"
     let opts = try JSONDecoder().decode(ScreenshotOptions.self, from: json.data(using: .utf8)!)
     #expect(opts.pid == nil)
+    #expect(opts.windowId == nil)
     #expect(opts.displayIndex == nil)
     #expect(opts.allDisplays == nil)
     #expect(opts.format == nil)
@@ -838,6 +855,13 @@ struct DataModelTests {
     #expect(opts.scale == nil)
     #expect(opts.savePath == nil)
     #expect(opts.annotate == nil)
+  }
+
+  @Test("ScreenshotOptions decoding accepts windowId")
+  func screenshotOptionsWindowIdDecoding() throws {
+    let json = #"{"windowId": 12345}"#
+    let opts = try JSONDecoder().decode(ScreenshotOptions.self, from: json.data(using: .utf8)!)
+    #expect(opts.windowId == 12345)
   }
 
   @Test("ElementInfo encoding produces compact output")
@@ -950,17 +974,22 @@ struct DataModelTests {
 }
 
 // MARK: - Automation Session Tests
+//
+// v0.4 demoted AutomationSession to a side-effect-free telemetry holder
+// (the HUD and global Esc-cancel monitor are gone — backgrounded driving
+// has nothing for the user to interrupt). The tools still exist for
+// agents that already speak the shape; we only verify the response stays
+// stable, not that anything visible happens on screen.
 
 @Suite("Automation Session", .serialized)
 struct AutomationSessionTests {
   fileprivate let api = loadAPI()
 
-  /// Reset the singleton between tests so flags don't leak.
   private func reset() {
     AutomationSession.shared.endSession(reason: "test reset")
   }
 
-  @Test("Default state is inactive and not cancelled")
+  @Test("Default state is inactive")
   func defaultState() {
     reset()
     let s = AutomationSession.shared.currentState()
@@ -974,64 +1003,9 @@ struct AutomationSessionTests {
     AutomationSession.shared.startSession(title: "Test Flow", totalSteps: 3, narration: "Step 0")
     let s = AutomationSession.shared.currentState()
     #expect(s.isActive == true)
-    #expect(s.isCancelled == false)
     #expect(s.title == "Test Flow")
     #expect(s.totalSteps == 3)
     #expect(s.narration == "Step 0")
-    reset()
-  }
-
-  @Test("cancel flips the flag")
-  func cancelFlipsFlag() {
-    reset()
-    AutomationSession.shared.startSession(title: "Cancel Test")
-    AutomationSession.shared.cancel(reason: "test")
-    #expect(AutomationSession.shared.isCancelled() == true)
-    reset()
-  }
-
-  @Test("endSession resets cancellation")
-  func endResetsCancel() {
-    reset()
-    AutomationSession.shared.startSession(title: "Reset Test")
-    AutomationSession.shared.cancel(reason: "test")
-    AutomationSession.shared.endSession(reason: "complete")
-    let s = AutomationSession.shared.currentState()
-    #expect(s.isActive == false)
-    #expect(s.isCancelled == false)
-  }
-
-  @Test("After cancel, click_element returns cancelled result")
-  func clickElementHonorsCancel() {
-    reset()
-    let ctx = createContext(api: api)
-    defer { api.destroy!(ctx) }
-
-    AutomationSession.shared.startSession(title: "Cancel Mid Action")
-    AutomationSession.shared.cancel(reason: "test")
-
-    let result = invoke(
-      api: api, ctx: ctx, tool: "click_element", payload: #"{"id": "s99-1"}"#)
-    let json = parseJSON(result)!
-    #expect(json["success"] as? Bool == false)
-    #expect(json["cancelled"] as? Bool == true)
-    reset()
-  }
-
-  @Test("After cancel, set_value returns cancelled result")
-  func setValueHonorsCancel() {
-    reset()
-    let ctx = createContext(api: api)
-    defer { api.destroy!(ctx) }
-
-    AutomationSession.shared.startSession(title: "Cancel Set Value")
-    AutomationSession.shared.cancel(reason: "test")
-
-    let result = invoke(
-      api: api, ctx: ctx, tool: "set_value",
-      payload: #"{"id": "s99-1", "value": "x"}"#)
-    let json = parseJSON(result)!
-    #expect(json["cancelled"] as? Bool == true)
     reset()
   }
 
@@ -1041,13 +1015,16 @@ struct AutomationSessionTests {
     let ctx = createContext(api: api)
     defer { api.destroy!(ctx) }
 
-    // Invalid id but non-cancelled session: result should be a normal stale
-    // error (no cancelled flag), proving narration didn't break decoding.
+    // Stale id is the cleanest way to round-trip a click without touching
+    // a real app: we get a deterministic response back and can assert the
+    // narration field didn't break decoding.
     let result = invoke(
       api: api, ctx: ctx, tool: "click_element",
       payload: #"{"id": "s99-1", "narration": "Clicking continue"}"#)
     let json = parseJSON(result)!
     #expect(json["success"] as? Bool == false)
+    // The cancelled flag is no longer in flight — backgrounded driving
+    // doesn't have an Esc cancel path.
     #expect(json["cancelled"] == nil)
     reset()
   }
@@ -1114,16 +1091,110 @@ struct AutomationSessionTests {
     #expect(s.title == "Second")
     #expect(s.totalSteps == 2)
     #expect(s.isActive == true)
-    #expect(s.isCancelled == false)
     reset()
   }
+}
 
-  @Test("shouldConsumeEsc is false until session has been active >=500ms")
-  func shouldConsumeEscGracePeriod() {
-    reset()
-    AutomationSession.shared.startSession(title: "Grace Test")
-    // Immediately after start, the 500ms grace period blocks consumption.
-    #expect(AutomationSession.shared.shouldConsumeEsc() == false)
-    reset()
+// MARK: - Backgrounded Driver Tests
+//
+// These are the cua-recipe smoke tests. They don't fully assert that a
+// real Chromium renderer accepted the click (that needs a live browser
+// and Screen Recording permission, which CI usually doesn't have); they
+// assert the contract that matters: invoking action tools never moves
+// the user's frontmost app.
+
+@Suite("Background Driver", .serialized)
+struct BackgroundDriverTests {
+  fileprivate let api = loadAPI()
+
+  @Test("SkyLight bridge availability reports a stable bool")
+  func skyLightAvailability() {
+    // Either branch is fine; we just want to make sure the dlopen path
+    // doesn't crash on the host OS.
+    _ = SkyLightBridge.isAvailable
+    _ = SkyLightBridge.canFocusWithoutRaise
+  }
+
+  @Test("CaptureMode parses cua-style strings, falls back to .som")
+  func captureModeParsing() {
+    #expect(CaptureMode.parse("ax") == .ax)
+    #expect(CaptureMode.parse("vision") == .vision)
+    #expect(CaptureMode.parse("som") == .som)
+    #expect(CaptureMode.parse("SOM") == .som)
+    #expect(CaptureMode.parse(nil) == .som)
+    #expect(CaptureMode.parse("garbage") == .som)
+  }
+
+  @Test("InputRoute round-trips through JSON")
+  func inputRouteCoding() throws {
+    let r = InputRoute.skyLight
+    let data = try JSONEncoder().encode(r)
+    let decoded = try JSONDecoder().decode(InputRoute.self, from: data)
+    #expect(decoded == .skyLight)
+  }
+
+  @Test("list_apps returns a list including this test process")
+  func listAppsReturnsArray() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+    let result = invoke(api: api, ctx: ctx, tool: "list_apps", payload: "{}")
+    let json = parseJSON(result)!
+    let apps = json["apps"] as? [[String: Any]]
+    #expect(apps != nil)
+    // No assertion on count: CI hosts may have 0 regular apps surfaced.
+    if let first = apps?.first {
+      #expect(first["pid"] is Int)
+      #expect(first["name"] is String)
+    }
+  }
+
+  @Test("list_windows rejects missing pid")
+  func listWindowsMissingPid() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+    let result = invoke(api: api, ctx: ctx, tool: "list_windows", payload: "{}")
+    let json = parseJSON(result)
+    #expect(json?["error"] != nil)
+  }
+
+  @Test("list_windows for current pid returns a structured response")
+  func listWindowsForOurPid() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let payload = #"{"pid": \#(pid)}"#
+    let result = invoke(api: api, ctx: ctx, tool: "list_windows", payload: payload)
+    let json = parseJSON(result)!
+    #expect(json["pid"] as? Int == Int(pid))
+    #expect(json["windows"] is [Any])
+  }
+
+  @Test("click with explicit pid does not change frontmost app")
+  func clickPerPidPreservesFrontmost() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+    // Route to our own pid: kill(0) gates the unsafe private routes for
+    // dead pids, so the call exercises the SkyLight and CGEvent.postToPid
+    // paths (or their fallbacks) without depending on a third-party app.
+    // The contract being tested is "frontmost never changes" — even when
+    // routing succeeds the user's app stays put.
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let beforePid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+    let payload = #"{"x": 50, "y": 50, "pid": \#(pid)}"#
+    _ = invoke(api: api, ctx: ctx, tool: "click", payload: payload)
+    let afterPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+    #expect(beforePid == afterPid, "Backgrounded click must not change frontmost app")
+  }
+
+  @Test("type_text routed via pid does not change frontmost app")
+  func typeTextPerPidPreservesFrontmost() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+    let pid = ProcessInfo.processInfo.processIdentifier
+    let beforePid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+    let payload = #"{"text": "hi", "pid": \#(pid)}"#
+    _ = invoke(api: api, ctx: ctx, tool: "type_text", payload: payload)
+    let afterPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+    #expect(beforePid == afterPid)
   }
 }

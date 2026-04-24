@@ -1,70 +1,77 @@
 ---
 name: osaurus-macos-use
-description: Control macOS via accessibility APIs. Use when the user asks to interact with native Mac apps, automate UI tasks, browse the web in Safari, fill forms, navigate menus, or perform any on-screen action.
+description: Drive macOS apps in the background. Use when the user asks you to interact with native Mac apps, automate UI tasks, browse the web in Safari, fill forms, navigate menus, or perform any on-screen action — without taking the user's screen or cursor away from them.
 metadata:
   author: osaurus
-  version: "0.3.1"
+  version: "3.0.0"
 ---
 
 # Osaurus macOS Use
 
-Automate macOS through the accessibility tree: open apps, observe the UI, click buttons, type into fields, navigate menus, browse the web.
+A backgrounded computer-use driver. Open apps, observe the UI, click buttons, type into fields, navigate menus, browse the web — **all while the user keeps working in the foreground**. Cursor never moves, focus never changes, Spaces never follow.
+
+Built on the cua-driver recipe: SkyLight `SLEventPostToPid` for cursor-warp-free routing, yabai-style `focusWithoutRaise` for AppKit-active flips, the (-1,-1) Chromium primer click for renderer-IPC user-activation gates, and a per-pid `CGEvent.postToPid` fallback for the rest.
 
 ## The Contract
 
-Four rules. Follow them in order, every time.
+Five rules. Follow them in order, every time.
 
-1. **Open** with `open_application`. It returns the app `pid` AND a starting `snapshot`. **Read the snapshot before doing anything else** — never send input to a freshly opened app without it.
-2. **Locate** with `find_elements({ pid, text, role? })` whenever you know what you're looking for. It is faster, cheaper, and more reliable than scanning a `get_ui_elements` result by hand.
-3. **Act** with `click_element`, `set_value`, `type_text`, `clear_field`, `press_key`. Always pass element ids in the `s{snapshot}-{n}` format (e.g. `"s7-12"`) returned by step 1 or 2.
-4. **Re-observe** only when the result tells you to:
+1. **Discover** with `list_apps()` if the target is already running, or skip to step 2 to launch fresh.
+2. **Open** with `open_application` (defaults to `background: true` — the app is NOT raised). It returns the app `pid` AND a starting capture (default `mode: "som"` — AX tree + screenshot + numeric `elementIndex` per element). **Read the capture before doing anything else.**
+3. **Locate** with `find_elements({ pid, text, role? })` whenever you know what you're looking for. Faster, cheaper, more reliable than scanning a `get_ui_elements` result by hand.
+4. **Act** with `click_element`, `set_value`, `type_text`, `clear_field`, `press_key`. Always pass element ids in the `s{snapshot}-{n}` format (e.g. `"s7-12"`). For raw-coordinate `click`/`scroll`/`type_text`/`press_key`, **always pass `pid`** — that's what keeps routing per-pid (no cursor warp).
+5. **Re-observe** only when the result tells you to:
    - `"stale": true` → call `get_ui_elements` (or `find_elements`) again, then retry.
    - `"removed": true` → element is gone; observe and find a new one.
    - `delta.focusedWindow` changed in a way you didn't expect → observe again.
-   - Otherwise (typing into a focused field, toggling a checkbox, pressing a shortcut) → keep going.
+   - Otherwise → keep going.
 
-If you'd rather not think about re-observing at all, use `act_and_observe` — it runs an action and returns a fresh snapshot in one call.
+If you'd rather not think about re-observing, use `act_and_observe` — runs an action and returns a fresh capture in one call.
 
-## Multi-step flows for non-technical users
+## Capture modes (cua-style)
 
-When the user is watching (configuring macOS, helping an elderly user, walking through anything more than 1-2 actions), do this:
+`open_application`, `get_ui_elements`, and `act_and_observe` accept `mode`:
 
-1. Call `start_automation_session({ title, totalSteps? })` first. The user sees a floating HUD that says "Automation in progress" with your title. They can press **Esc** at any time to stop you.
-2. On every action call, pass a short **`narration`** string in plain language: `click_element({ id: "s2-3", narration: "Clicking 'Continue'" })`. The HUD updates so the user can follow along.
-3. Optionally call `update_automation_session({ stepIndex: 3 })` to advance the "Step 3 of 7" progress.
-4. Call `end_automation_session({ reason: "complete" })` when you're done. (Idle sessions auto-end after ~3s, so this is optional but cleaner.)
+- **`som`** (default) — AX tree + annotated screenshot + per-element `elementIndex`. Best for vision-first agents that ground on pixels.
+- **`ax`** — tree only. Fastest. **No Screen Recording permission needed.** Best for AppKit/SwiftUI apps with rich AX trees.
+- **`vision`** — screenshot only. Smallest payload for VLMs that don't need the tree.
 
-Every action result includes `cancelled: true` if the user pressed Esc. **When you see that, stop immediately and tell the user the automation was cancelled.** Don't retry, don't keep going.
+In `som` mode, every element is addressable two ways: by snapshot id (`"s7-12"`) AND by `elementIndex` (1, 2, 3, …). Use whichever your model prefers — both resolve to the same element.
 
-The HUD also appears automatically the first time any tool is called, even if you forget `start_automation_session` — but a real title and per-step narration is much better than the generic default.
+## Routing chain
+
+You don't usually need to think about this, but it's useful when debugging:
+
+1. **AXPress / AXShowMenu / AXValue** — `click_element` etc. try this first. Fully backgrounded.
+2. **`SLEventPostToPid`** — SkyLight private framework, loaded at runtime. Trusted by Chromium renderers, no cursor warp.
+3. **`CGEvent.postToPid`** — public CoreGraphics. Works for almost everything except Chromium web content.
+4. **HID tap** — last resort. **This is the only path that warps the user's cursor.** Auto-falls-back here for canvas/Blender/Unity.
+
+`drag` is the one operation that ALWAYS uses the HID tap (drop receivers key on the global cursor position).
 
 ## Canonical Recipe
 
 ```
-1. start_automation_session({ title: "Visiting example.com", totalSteps: 6 })
+1. list_apps()
+   → { apps: [..., { pid: 1234, name: "Safari", bundleId: "com.apple.Safari", active: false }, ...] }
 
-2. open_application({ identifier: "Safari", narration: "Opening Safari" })
-   → { pid: 1234, name: "Safari", snapshot: { snapshotId: 1, windows: [...], elements: [...] } }
+2. open_application({ identifier: "Safari", mode: "som" })
+   → { pid: 1234, som: { snapshot: { snapshotId: 1, ... }, image: { mimeType: "image/jpeg", data: "..." }, elements: [{ elementIndex: 1, id: "s1-3", role: "textfield", label: "Address" }, ...] } }
 
-3. press_key({ key: "l", modifiers: ["command"], pid: 1234, narration: "Focusing the address bar" })
+3. press_key({ key: "l", modifiers: ["command"], pid: 1234 })
    → { success: true, delta: { focusedElement: { role: "textfield", label: "Address" } } }
 
-4. type_text({ text: "https://example.com", narration: "Entering the URL" })
-   → { success: true }
-
-5. press_key({ key: "return", pid: 1234, narration: "Loading the page" })
-   → { success: true, delta: { focusedWindow: "Example Domain" } }
+4. type_text({ text: "https://example.com", pid: 1234 })
+5. press_key({ key: "return", pid: 1234 })
 
 6. find_elements({ pid: 1234, text: "More information", role: "link" })
    → { snapshotId: 2, elements: [{ id: "s2-3", role: "link", label: "More information..." }] }
 
-7. click_element({ id: "s2-3", narration: "Following the 'More information' link" })
+7. click_element({ id: "s2-3" })
    → { success: true, delta: { focusedWindow: "IANA-managed Reserved Domains" } }
-
-8. end_automation_session({ reason: "complete" })
 ```
 
-Token cost for this whole flow: ~3-5K. Compare to ~150K if you observed the entire tree after every step.
+The user never sees Safari come forward. Their own app stays focused throughout.
 
 ## Snapshot Ids and the Cache
 
@@ -77,48 +84,74 @@ If you ever see a result with `"stale": true`, the fix is always the same: re-ob
 
 ## Tool Reference
 
-| Tool | When to use |
-|---|---|
-| `open_application` | First step. Opens/activates an app and returns an initial snapshot. |
-| `get_ui_elements` | Full snapshot of an app's UI. Use after navigation if `find_elements` isn't specific enough. Defaults: 150 elements, depth 20, interactive only. Set `focusedWindowOnly: true` for a cheap re-observation. |
-| `find_elements` | Server-side search by `text` and/or `role`. Default `limit: 10`. **Prefer this over `get_ui_elements` whenever you know what you're looking for.** |
-| `get_active_window` | Discover the frontmost app's pid when you don't have one. |
-| `click_element` | Click by snapshot id. `button: "right"` and `doubleClick: true` supported. |
-| `set_value` | Replace a field's value instantly. Best for forms. |
-| `clear_field` | Empty a text field. Use before `type_text` if you want to replace, not append. |
-| `type_text` | Keystroke-by-keystroke typing. Pass `id` to focus first; `replace: true` (default) clears the field first. |
-| `press_key` | Keyboard shortcuts and special keys. Pass `pid` to get a focus delta back. |
-| `scroll` | Pass `x`/`y` to position the mouse first if scrolling a specific area. |
-| `drag` | Coordinate-based drag for sliders, window resize, drag-and-drop. |
-| `click` | Last-resort coordinate click. Use only when an element isn't accessible (canvas apps). |
-| `act_and_observe` | Run any element action AND get a fresh snapshot in one call. Use when you'd otherwise have to re-observe immediately. |
-| `take_screenshot` | When the AX tree isn't enough (visual layout, images, canvas). Set `annotate: true` with `pid` to overlay element ids on the image. |
-| `list_displays` | Multi-monitor setups only. |
-| `start_automation_session` | Show the HUD with a title and (optional) step count. Strongly recommended for any flow >2 actions. |
-| `update_automation_session` | Change the HUD's title, narration, or step counter outside of an action call. |
-| `end_automation_session` | Hide the HUD and reset state when the flow is done. |
+### Discovery / observation
+
+| Tool                    | When to use                                                                                                                              |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_apps`             | List all running GUI apps. Use before `open_application` if the target is already up.                                                    |
+| `list_windows({ pid })` | Per-pid window list with `windowId`. Pass the windowId to `take_screenshot` (windowId arg) to read a specific window without raising it. |
+| `open_application`      | First step for a fresh app. Defaults to `background: true` — never raises. Returns an initial capture in your chosen `mode`.             |
+| `get_ui_elements`       | Capture by pid. `mode: "som"` (default) returns tree + screenshot + elementIndex; `"ax"` is tree only; `"vision"` is screenshot only.    |
+| `find_elements`         | Server-side search by text and/or role. **Prefer this over `get_ui_elements` whenever you know what you're looking for.**                |
+| `get_active_window`     | The user's frontmost window (mostly for figuring out where they are).                                                                    |
+
+### Element actions (snapshot id required)
+
+| Tool            | When to use                                                                                                                                |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `click_element` | Click by snapshot id. `button: "right"` and `doubleClick: true` supported. Tries AXPress first → SkyLight per-pid → HID tap.               |
+| `set_value`     | Replace a field's value instantly via AX. Best for forms.                                                                                  |
+| `clear_field`   | Empty a text field. Use before `type_text` if you want to replace, not append.                                                             |
+| `type_text`     | Keystroke-by-keystroke typing. Pass `id` to focus first; `replace: true` (default) clears the field. Routed per-pid via the element's pid. |
+
+### Coordinate / keyboard actions
+
+| Tool        | When to use                                                                                                                         |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `press_key` | Keyboard shortcuts. Pass `pid` to route per-pid (no foreground steal) AND get a focus delta back.                                   |
+| `click`     | Coordinate click. **Always pass `pid`** to keep routing backgrounded. Without it, falls back to the HID tap which warps the cursor. |
+| `scroll`    | Direction + amount. Pass `pid` to route per-pid.                                                                                    |
+| `drag`      | Coordinate drag. Always uses the HID tap; drop receivers need the cursor to track.                                                  |
+
+### Combined / utility
+
+| Tool              | When to use                                                                                                                           |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `act_and_observe` | Run any element action AND get a fresh capture (`mode`-shaped) in one call.                                                           |
+| `take_screenshot` | When you need pixels. `windowId` captures exactly one window (works for occluded / off-Space). `annotate: true` overlays element ids. |
+| `list_displays`   | Multi-monitor setups only.                                                                                                            |
+
+### Session telemetry
+
+| Tool                                  | When to use                                                                                       |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `start_automation_session({ title })` | Optional. Records a title for the agent transcript. **No HUD, no Esc cancel, no UI side effect.** |
+| `update_automation_session`           | Update title / narration / step counter.                                                          |
+| `end_automation_session`              | Reset the record. Optional.                                                                       |
 
 ## Tips That Actually Matter
 
-1. **Always pass `pid` to `press_key`** when you care whether it changed the focused window/element. The returned `delta` saves you a snapshot.
-2. **`set_value` first, `type_text` if it fails.** `set_value` is instant and correct for most fields. Fall back to `type_text` (which focuses + clears + types) for search fields, password fields, or anything that needs per-keystroke events.
-3. **Check `truncated: true` in any snapshot.** If true, raise `maxElements` or use `find_elements` instead of `get_ui_elements`.
-4. **`focusedWindowOnly: true` is your friend.** Cheap re-observation when you know the action only affected the focused window.
-5. **Keyboard shortcuts beat menu navigation.** `press_key("s", modifiers: ["command"])` is one tool call; clicking File > Save is three.
-6. **Roles can be passed in any case.** `"button"`, `"Button"`, and `"AXButton"` all work in `find_elements({ role })` and `get_ui_elements({ roles })`.
+1. **Pass `pid` to every coordinate-based action** (`click`, `scroll`, `type_text`, `press_key`). Without it, the call falls back to the HID tap and warps the cursor.
+2. **`set_value` first, `type_text` if it fails.** `set_value` is instant and correct for most fields. `type_text` (focus + clear + type) is the fallback for search fields, password fields, anything that needs per-keystroke events.
+3. **Use `windowId` from `list_windows` when capturing a specific window.** It works for windows that are occluded, hidden, or on a different Space.
+4. **Check `truncated: true` in any snapshot.** If true, raise `maxElements` or use `find_elements`.
+5. **`focusedWindowOnly: true` is your friend.** Cheap re-observation when the action only changed the focused window.
+6. **Keyboard shortcuts beat menu navigation.** `press_key("s", modifiers: ["command"], pid: ...)` is one tool call; clicking File > Save is three.
+7. **Roles can be passed in any case.** `"button"`, `"Button"`, and `"AXButton"` all work.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| `"stale": true` | Re-observe (any of `get_ui_elements`, `find_elements`, `open_application`) and retry with the fresh id. |
-| `"removed": true` | The element is gone from the UI. Re-observe and find a new one. |
-| `"cancelled": true` | User pressed Esc. **Stop**, tell the user the automation was cancelled. Do not retry. |
-| `error` mentions "not a valid snapshot id" | You passed a v0.2 integer id. Use the `s{n}-{n}` strings returned by the new tools. |
-| Empty `elements: []` from `get_ui_elements` | Check `truncated`; lower `maxDepth`; broaden `interactiveOnly: false`; or use `find_elements`. |
-| `set_value` returns "not editable" | Fall back to `type_text` with the element id (auto-focuses and replaces). |
-| App won't open / wrong app focused | Try the bundle id (`com.apple.Safari`) instead of name. Use `get_active_window` to confirm. |
-| No elements at all | The host app needs Accessibility permission in System Settings > Privacy & Security > Accessibility. |
+| Symptom                                                    | Fix                                                                                                                                                           |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `"stale": true`                                            | Re-observe (any of `get_ui_elements`, `find_elements`, `open_application`) and retry with the fresh id.                                                       |
+| `"removed": true`                                          | The element is gone from the UI. Re-observe and find a new one.                                                                                               |
+| Cursor moves during a click                                | You called `click` without `pid`, OR the target is a canvas/game app filtering per-pid routes. Pass `pid`; for canvas apps, accept the warp (it's by design). |
+| Right-click on a Chrome web page does a left-click instead | Chromium coerces synthetic right-clicks at the renderer-IPC layer. Use `click_element` on an AX-addressable target so `AXShowMenu` fires instead.             |
+| `error` mentions "not a valid snapshot id"                 | You passed a v0.2 integer id. Use the `s{n}-{n}` strings returned by the new tools.                                                                           |
+| Empty `elements: []` from `get_ui_elements`                | Check `truncated`; lower `maxDepth`; broaden `interactiveOnly: false`; or use `find_elements`.                                                                |
+| `set_value` returns "not editable"                         | Fall back to `type_text` with the element id (auto-focuses and replaces).                                                                                     |
+| App won't open / wrong app focused                         | Try the bundle id (`com.apple.Safari`) instead of name. Use `get_active_window` to confirm.                                                                   |
+| No elements at all                                         | The host app needs Accessibility permission in System Settings > Privacy & Security > Accessibility.                                                          |
 
 ## Reference
 
@@ -126,7 +159,7 @@ For per-app recipes (Safari URL bar, web forms, tab management) and the full key
 
 ## Limitations
 
-- **Canvas apps** (Figma, games): no element tree. Use `take_screenshot` + `click` with coordinates.
-- **Poorly accessible apps** (some Electron / older apps): fall back to coordinate clicks.
+- **Canvas apps** (Figma, games, Blender, Unity): per-pid event routes are filtered. Driver auto-falls back to the HID tap, which warps the cursor.
+- **Chromium right-click on web content**: coerced to left-click. Use AX paths instead.
 - **Highly dynamic web apps**: re-observe more often; prefer `find_elements` over caching ids across navigation.
-- **Iframes / web in non-Safari browsers**: AX coverage varies; Safari is most reliable.
+- **Iframes**: AX coverage varies. Safari is most reliable.

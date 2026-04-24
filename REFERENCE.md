@@ -4,16 +4,18 @@ Deep reference material for `osaurus-macos-use`. Read this only if [SKILL.md](SK
 
 ## Per-App Recipes
 
-### Safari: navigate to a URL
+### Safari: navigate to a URL (in the background)
 
 ```
-1. open_application({ identifier: "Safari" })
-   → { pid, snapshot }
+1. open_application({ identifier: "Safari" })   // background: true is the default
+   → { pid, som: { snapshot, image, elements } }
 2. press_key({ key: "l", modifiers: ["command"], pid })
-3. type_text({ text: "https://example.com" })
+3. type_text({ text: "https://example.com", pid })
 4. press_key({ key: "return", pid })
-5. find_elements({ pid, text: "Sign in", role: "link" })  // or whatever you need next
+5. find_elements({ pid, text: "Sign in", role: "link" })
 ```
+
+The user never sees Safari come forward.
 
 ### Safari: click a link on a loaded page
 
@@ -30,7 +32,7 @@ Deep reference material for `osaurus-macos-use`. Read this only if [SKILL.md](SK
 ```
 1. find_elements({ pid, role: "textfield", text: "email" })
 2. set_value({ id: <result>, value: "user@example.com" })
-3. find_elements({ pid, role: "secur etextfield" })
+3. find_elements({ pid, role: "securetextfield" })
 4. set_value({ id: <result>, value: "hunter2" })
 5. find_elements({ pid, role: "button", text: "Sign in" })
 6. click_element({ id: <result> })
@@ -38,20 +40,26 @@ Deep reference material for `osaurus-macos-use`. Read this only if [SKILL.md](SK
 
 If `set_value` returns an error, the field probably wants real keystrokes — fall back to `type_text({ id, text, replace: true })`.
 
+### Chromium browsers (Chrome, Edge, Brave, Arc)
+
+The driver auto-detects Chromium-class apps (by bundle id, plus a generic Electron-Framework probe) and inserts the (-1, -1) primer click before each real click so the renderer's user-activation gate accepts the synthesized event.
+
+**Right-click on web content does NOT work** as a synthesized event — Chromium coerces it to a left-click at the renderer-IPC boundary. For AX-addressable targets (links, buttons, toolbar items), `click_element({ button: "right" })` falls back to `AXShowMenu` which IS reliable.
+
 ### Safari: tab management (keyboard shortcuts only)
 
 | Action | `press_key` |
 |---|---|
-| New tab | `("t", ["command"])` |
-| Close tab | `("w", ["command"])` |
-| Next tab | `("}", ["command", "shift"])` |
-| Previous tab | `("{", ["command", "shift"])` |
-| Reopen closed tab | `("z", ["command", "shift"])` |
-| Focus address bar | `("l", ["command"])` |
-| Reload | `("r", ["command"])` |
-| Back | `("[", ["command"])` |
-| Forward | `("]", ["command"])` |
-| Reader mode | `("r", ["command", "shift"])` |
+| New tab | `("t", ["command"], pid)` |
+| Close tab | `("w", ["command"], pid)` |
+| Next tab | `("}", ["command", "shift"], pid)` |
+| Previous tab | `("{", ["command", "shift"], pid)` |
+| Reopen closed tab | `("z", ["command", "shift"], pid)` |
+| Focus address bar | `("l", ["command"], pid)` |
+| Reload | `("r", ["command"], pid)` |
+| Back | `("[", ["command"], pid)` |
+| Forward | `("]", ["command"], pid)` |
+| Reader mode | `("r", ["command", "shift"], pid)` |
 
 ### Native app: handle a dialog
 
@@ -78,27 +86,40 @@ Almost always faster as a keyboard shortcut. If you must click:
 ### Right-click for a context menu
 
 ```
-1. click_element({ id: <element>, button: "right" })
+1. click_element({ id: <element>, button: "right" })   // uses AXShowMenu when available
 2. find_elements({ pid, role: "menuitem", text: "Copy" })
 3. click_element({ id: <result> })
 ```
 
-### Switch between apps
+### Switch between apps without bringing them forward
 
 ```
-open_application({ identifier: "Notes" })
-// returns a fresh snapshot for Notes; the previous app's ids become stale
+list_apps()
+   → pick the pid you want
+get_ui_elements({ pid: <picked>, mode: "som" })
+   → fresh snapshot for the new app; its elements come back annotated
 ```
 
-You can also `press_key("tab", modifiers: ["command"])` and then `get_active_window` to find the new pid.
+(Don't use `command+tab` — that physically switches the user's frontmost app.)
+
+### Capture a specific window without raising it
+
+```
+1. list_windows({ pid })
+   → { windows: [{ windowId: 12345, title: "Doc 1", focused: false, ... }, ...] }
+2. take_screenshot({ windowId: 12345 })
+```
+
+`CGWindowListCreateImage` works on occluded windows, hidden windows, and windows on a different Space. The user sees nothing.
 
 ## Keyboard Shortcuts (use with `press_key`)
+
+When backgrounded, always pass `pid`. Without it, keystrokes go through the global HID tap (visible to the user).
 
 ### System
 
 | Action | Key | Modifiers |
 |---|---|---|
-| Switch app | `tab` | `["command"]` |
 | Spotlight search | `space` | `["command"]` |
 | Force quit | `escape` | `["command", "option"]` |
 | Lock screen | `q` | `["command", "control"]` |
@@ -155,7 +176,46 @@ Pass any of these to `get_ui_elements({ roles })` or `find_elements({ role })`. 
 
 **Menus:** `menuitem`, `menubaritem`, `menubutton`
 
-## Snapshot Result Schema
+## Capture Modes
+
+`open_application`, `get_ui_elements`, and `act_and_observe` accept a `mode` parameter.
+
+### `mode: "ax"` — accessibility tree only
+
+Returns a `TraversalResult`. Same shape as the v0.3 response. Fastest. **No Screen Recording permission needed.**
+
+### `mode: "vision"` — screenshot only
+
+Returns an `SOMResult` with `image` populated, `snapshot` still present (the AX tree is gathered as part of building the elementIndex, but you can ignore it), and `elements: [{ elementIndex, id, role, label, x, y, w, h }]`.
+
+### `mode: "som"` (default) — set-of-mark
+
+Returns an `SOMResult` with both `image` and `snapshot` populated, and the screenshot is annotated with the existing element-id labels. Best for vision-first agents.
+
+### `SOMResult` shape
+
+```json
+{
+  "mode": "som",
+  "snapshot": {
+    "snapshotId": 7,
+    "pid": 1234,
+    "elements": [...],
+    "windows": [...]
+  },
+  "image": { "type": "image", "mimeType": "image/jpeg", "data": "<base64>" },
+  "windowId": null,
+  "elements": [
+    { "elementIndex": 1, "id": "s7-3", "role": "textfield", "label": "Address", "x": 100, "y": 50, "w": 600, "h": 24 },
+    { "elementIndex": 2, "id": "s7-7", "role": "button", "label": "Reload", "x": 720, "y": 50, "w": 24, "h": 24 }
+  ],
+  "routeUsed": null
+}
+```
+
+`elementIndex` is assigned in the order elements appear in `snapshot.elements` (focused window first, then the rest). Both `elementIndex` and `id` resolve to the same underlying element when used with action tools.
+
+## Snapshot Result Schema (`mode: "ax"`)
 
 ```json
 {
@@ -189,74 +249,6 @@ Pass any of these to `get_ui_elements({ roles })` or `find_elements({ role })`. 
 
 `null` / missing fields are omitted from JSON. Use `path` and `windowId` to disambiguate when several elements share a label (e.g., two "OK" buttons).
 
-## Automation Session Tools
-
-The plugin shows a floating "Automation in progress" HUD whenever any tool is active. The HUD lets the user press Esc at any time to cancel; the next tool call returns `cancelled: true`. Three tools let agents drive the HUD intentionally:
-
-### `start_automation_session`
-
-```json
-{
-  "title": "Setting up iCloud Backup",
-  "totalSteps": 5,
-  "narration": "Opening System Settings"
-}
-```
-
-- `title` (required): plain-language session title, shown large in the HUD.
-- `totalSteps` (optional): enables `Step N of M` progress text.
-- `narration` (optional): initial subtitle.
-
-If a session is already active, calling `start_automation_session` supersedes it (no leak, new title/state takes over).
-
-Returns:
-
-```json
-{
-  "success": true,
-  "isActive": true,
-  "isCancelled": false,
-  "title": "Setting up iCloud Backup",
-  "totalSteps": 5,
-  "narration": "Opening System Settings",
-  "stepIndex": null
-}
-```
-
-### `update_automation_session`
-
-Update one or more HUD fields without performing an action. Useful for advancing `stepIndex` or rewriting the title mid-flow. All fields are optional.
-
-```json
-{
-  "narration": "Verifying your Apple ID",
-  "stepIndex": 3
-}
-```
-
-### `end_automation_session`
-
-```json
-{ "reason": "complete" }
-```
-
-- `reason` (optional): `"complete" | "aborted" | "error"`. Reserved for future logging; currently informational.
-
-Hides the HUD, stops the Esc tap, resets the cancellation flag. Idle sessions auto-end after ~3 seconds of no tool calls, so this is optional but cleaner.
-
-### Per-action `narration` arg
-
-Every action tool (`click_element`, `set_value`, `type_text`, `clear_field`, `press_key`, `scroll`, `drag`, `click`, `act_and_observe`, `open_application`) accepts an optional `narration` string. It updates the HUD subtitle right before the action runs:
-
-```json
-{
-  "id": "s2-3",
-  "narration": "Clicking the Sign In button"
-}
-```
-
-Strongly recommended for supervised flows. Cheap to add and dramatically improves the user's understanding of what's happening.
-
 ## Action Result Schema
 
 Successful action:
@@ -270,18 +262,6 @@ Successful action:
   }
 }
 ```
-
-User pressed Esc to cancel:
-
-```json
-{
-  "success": false,
-  "cancelled": true,
-  "error": "Cancelled by user (Esc was pressed during the automation)."
-}
-```
-
-When you see `cancelled: true`, stop the flow and surface the cancellation to the user. Do not retry.
 
 Stale id (re-observe and retry):
 
@@ -311,20 +291,33 @@ Malformed (you passed an id that doesn't look like `s{n}-{n}`):
 }
 ```
 
+The `cancelled: true` envelope from v0.3 is preserved on `ElementActionResult` for backwards compat but is never set on the input path now (the global Esc cancel monitor was removed in v0.4 — backgrounded driving has nothing to interrupt).
+
 ## `act_and_observe` Schema
 
-Combined action + snapshot in one call. Eliminates the most common failure mode (forgetting to re-observe after navigation).
+Combined action + capture in one call. Eliminates the most common failure mode (forgetting to re-observe after navigation).
 
 ```json
 {
   "action": "click_element",
   "id": "s7-12",
-  "observe": "full",         // or "focused_window" (cheaper) or "none"
+  "mode": "som",            // capture mode for the post-action snapshot
+  "windowId": 12345,         // optional; SOM/vision will capture this exact window
+  "observe": "full",        // "full", "focused_window" (cheaper), or "none"
   "maxElements": 150
 }
 ```
 
-Response:
+Response (with `mode: "som"`):
+
+```json
+{
+  "action": { "success": true, "delta": { ... } },
+  "som": { "snapshot": { ... }, "image": { ... }, "elements": [...] }
+}
+```
+
+Response (with `mode: "ax"`):
 
 ```json
 {
@@ -337,13 +330,25 @@ Supported `action` values: `click_element`, `set_value`, `type_text`, `press_key
 
 ## Annotated Screenshots
 
-`take_screenshot({ pid, annotate: true })` overlays element-id labels on the image using the most recent snapshot for that pid. Useful when you want a vision model to reference specific ids visually.
+`take_screenshot({ pid, annotate: true })` overlays element-id labels on the image using the most recent snapshot for that pid. `take_screenshot({ windowId, annotate: true })` does the same for a specific window.
 
-Requires that you've already called `get_ui_elements` or `find_elements` for that pid recently (otherwise there are no ids to overlay).
+Requires that you've already called `get_ui_elements` or `find_elements` for the relevant pid recently (otherwise there are no ids to overlay).
 
 ## Coordinates
 
 All coordinates (`x`, `y`, element bounds, `click` arguments) are **global screen pixels**, top-left origin. On multi-display setups, use `list_displays` to map indices to screen-space rectangles.
+
+## Background-mode contract
+
+When you pass `pid` to `click`/`type_text`/`press_key`/`scroll`, the driver routes through:
+
+1. **`SLEventPostToPid`** (SkyLight private framework, loaded via `dlopen`). No cursor warp; trusted by Chromium renderers.
+2. **`CGEvent.postToPid`** (public CoreGraphics fallback when SkyLight is unavailable). No cursor warp but Chromium web content drops the event silently.
+3. **`CGEvent.post(.cghidEventTap)`** as a final fallback. **Warps the cursor** — only happens when the pid isn't WindowServer-visible (e.g. CLI process) or when the user calls `click`/`scroll` without `pid`.
+
+`drag` always uses the HID tap (drop receivers key on the global cursor position).
+
+A best-effort `focusWithoutRaise(pid)` is invoked before each backgrounded click — yabai's two-`SLPSPostEventRecordTo` pattern flips AppKit-active routing to the target without `SLPSSetFrontProcess` raising the window or pulling its Space forward.
 
 ## Permissions
 
@@ -352,13 +357,60 @@ The host app needs Accessibility permission:
 - System Settings > Privacy & Security > Accessibility
 - Add the application running this plugin (e.g., Osaurus, or your terminal if running from CLI).
 
-Without this permission, the AX queries return empty / fail silently in macOS-defined ways. The Esc-cancel `CGEventTap` also requires Accessibility — if denied, Esc-to-cancel silently no-ops (the HUD still shows up, agent still works, but Esc won't stop the automation).
+Without this permission, AX queries return empty / fail silently in macOS-defined ways.
 
-Sandboxed host apps may have `CGEventTapCreate` blocked even with Accessibility granted; same fallback (no Esc, everything else works).
+`mode: "som"` and `mode: "vision"` (and `take_screenshot`) additionally need Screen Recording permission. `mode: "ax"` does not.
+
+Sandboxed host apps may have the SkyLight `dlopen` blocked. In that case the driver gracefully degrades to `CGEvent.postToPid` for all per-pid routes — still backgrounded, but Chromium web content will reject events.
+
+## Session Tools (telemetry only)
+
+v0.4 removed the on-screen HUD and the global Esc-cancel monitor. The session tools remain as a side-effect-free telemetry channel:
+
+### `start_automation_session`
+
+```json
+{
+  "title": "Setting up iCloud Backup",
+  "totalSteps": 5,
+  "narration": "Opening System Settings"
+}
+```
+
+Returns:
+
+```json
+{
+  "success": true,
+  "isActive": true,
+  "isCancelled": false,
+  "title": "Setting up iCloud Backup",
+  "totalSteps": 5,
+  "narration": "Opening System Settings",
+  "stepIndex": null
+}
+```
+
+`isCancelled` is always `false` in v0.4+ (the field stays in the schema for backwards compat).
+
+### `update_automation_session`
+
+```json
+{ "narration": "Verifying your Apple ID", "stepIndex": 3 }
+```
+
+### `end_automation_session`
+
+```json
+{ "reason": "complete" }
+```
+
+Resets the session record. Optional, since session state is purely informational now.
 
 ## Known limitations
 
-- **Single global session.** The HUD and cancel flag are a process singleton. Two agents using the plugin in parallel will share one session.
-- **Drag is uninterruptible.** `drag()` always releases the mouse button via `defer`, even on errors, so the OS can never be left thinking the user is holding the button down. The trade-off is that `drag` cannot be cancelled mid-flight.
-- **AX timeout is 3 seconds.** Blocking AX calls into a wedged target app fail in 3s instead of hanging forever, but you'll wait up to that long before the next cancel check.
-- **Display sleep does not auto-end the session.** Some flows are intentionally long; we leave it to the user to press Esc.
+- **Chromium right-click on web content** is coerced to a left-click at the renderer-IPC boundary, even via SkyLight. Use `click_element` on AX-addressable targets so `AXShowMenu` fires.
+- **Canvas apps (Blender GHOST, Unity, games)** filter per-pid event routes entirely. Driver auto-falls back to the HID tap, which warps the cursor.
+- **Drag is uninterruptible AND warps the cursor** (drop receivers need the cursor to track). The mouse button is always released even on errors.
+- **AX timeout is 3 seconds.** Blocking AX calls into a wedged target app fail in 3s instead of hanging forever.
+- **Single global session.** The session record is a process singleton.

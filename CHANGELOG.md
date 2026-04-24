@@ -1,6 +1,70 @@
 # Changelog
 
-## 0.3.1 — Automation HUD with Esc-to-cancel
+## 3.0.0 — Backgrounded driver (cua recipe)
+
+A ground-up rework that turns the plugin from a foreground co-pilot into a fully **backgrounded** macOS driver. Inspired by the [cua-driver](https://github.com/trycua/cua/blob/main/blog/inside-macos-window-internals.md) write-up: the agent can now drive any Mac app while the user keeps working in the foreground — cursor never moves, focus never changes, Spaces never follow. Shipped alongside cua-style `ax` / `vision` / `som` capture modes and per-window addressing.
+
+### Routing chain (new)
+
+Every action now picks the most-backgrounded transport that works:
+
+1. **AXPress / AXShowMenu / AXValue** — first choice for `click_element`, `set_value`, `right_click`. Fully backgrounded for AX-addressable targets.
+2. **`SLEventPostToPid`** (SkyLight private framework, loaded at runtime via `dlopen`) — Chromium-trusted, no cursor warp.
+3. **`CGEvent.postToPid`** — public CoreGraphics; works for almost everything except Chromium web content.
+4. **HID tap fallback** (`CGEvent.post(.cghidEventTap)`) — last resort for canvas/Blender/Unity-style apps that filter per-pid event routes. **This is the only path that warps the user's cursor.**
+
+A best-effort `focusWithoutRaise(pid:)` (yabai's two-`SLPSPostEventRecordTo` pattern) is invoked before each backgrounded click so AppKit-active routing flips to the target without `SLPSSetFrontProcess` raising the window or pulling its Space forward.
+
+### New: capture modes (cua-style)
+
+`open_application`, `get_ui_elements`, and `act_and_observe` now accept `mode`:
+
+- **`som`** (default) — set-of-mark: AX tree + annotated screenshot + numeric `elementIndex`. Vision-first agents can address elements either by `elementIndex` or by the existing `s7-12` snapshot ids.
+- **`ax`** — tree only. Fastest. **No Screen Recording permission needed.**
+- **`vision`** — screenshot only.
+
+### New tools
+
+- **`list_apps`** — every running GUI app with pid, bundleId, name, active, hidden. Use this before `open_application` when the target is already running.
+- **`list_windows({ pid })`** — per-pid window list with `windowId` (real `CGWindowID` aligned with `CGWindowListCopyWindowInfo`), title, focused/minimized, and bounds. Pass the `windowId` to `take_screenshot` to capture exactly one window without raising it.
+
+### New args
+
+- **`background: true`** (default) on `open_application`. Launches with `activates=false`, `addsToRecentItems=false`, `hides=true`. Set `false` only when the user actually needs to look at the target.
+- **`pid`** on `click`, `type_text`, `press_key`, `scroll`, `drag` — explicit per-pid routing. When omitted, `type_text`/`press_key` derive the pid from `id` or fall back to the most recent snapshot.
+- **`windowId`** on `take_screenshot` — direct `CGWindowID` capture. Works for occluded / off-Space windows.
+- **`mode`** on `open_application` / `get_ui_elements` / `act_and_observe`.
+
+### Removed
+
+- **`AutomationHUD`** (the floating "Automation in progress" panel) — backgrounded driving is invisible to the user, so there's nothing to surface.
+- **`EscCancelMonitor`** (the global Esc tap) — same reason. There's no foreground takeover to interrupt.
+- **`localEventsSuppressionInterval`** machinery — paired with the HUD; unnecessary for backgrounded events.
+
+`AutomationSession` was slimmed to a side-effect-free telemetry holder. `start_automation_session` / `update_automation_session` / `end_automation_session` still work and return the same shape; the `cancelled` field on `ElementActionResult` remains in the schema for backwards compat but is never set on the input path now.
+
+### Tool count
+
+18 → 20 (added `list_apps`, `list_windows`).
+
+### Known gaps
+
+- **Chromium right-click on web content** — the renderer-IPC layer coerces synthetic right-clicks to left-clicks, even via SkyLight. `click_element` prefers `AXShowMenu` for AX-addressable targets, the only reliable right-click path. Documented in the manifest description.
+- **Canvas apps (Blender GHOST, Unity, games)** — filter per-pid event routes entirely. Driver auto-falls back to the HID tap, which warps the cursor.
+- **Drag** — most drop receivers key on the global cursor position, so `drag` always uses the HID tap and warps the cursor by design.
+
+### Out of scope
+
+- Multi-cursor rendering / on-screen overlay of the agent's pointer (cua's demo capture feature).
+- Auto-updater / installer scripts. This stays a Swift library plugin.
+
+### Migration
+
+- Calls without `pid` still work — `type_text`/`press_key` keep their old behavior of routing to the most recent snapshot's pid (which used to require explicit narration; now it's automatic).
+- Agents previously listening for `cancelled: true` will simply never see it anymore. Drop the special-case handler.
+- Anything that explicitly relied on the HUD or Esc cancel needs to migrate to a session-log model (the session tools are now the read surface).
+
+## 2.0.0 — Automation HUD with Esc-to-cancel
 
 A user-visible "Automation in progress" HUD with system-wide Esc-to-cancel and per-step narration. Built so non-technical users (and agents helping elderly users walk through macOS configuration) can watch what's happening, follow along, and stop safely if something goes wrong.
 

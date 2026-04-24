@@ -79,26 +79,6 @@ private func traverse(
   return runOnMain { AccessibilityManager.shared.traverse(filter: filter, search: s) }
 }
 
-// MARK: - Automation Gate
-
-/// Called at the top of every action-style tool. Updates the HUD's narration
-/// and bails immediately if the user pressed Esc. Returns the bail-out JSON
-/// when cancelled, or nil to continue.
-private func gateAutomation(narration: String?) -> String? {
-  AutomationSession.shared.markActive(narration: narration)
-  if AutomationSession.shared.isCancelled() {
-    return serializeResult(ElementActionResult.cancelled())
-  }
-  return nil
-}
-
-/// Lightweight version for observation tools: keeps the HUD alive but does
-/// NOT bail on cancel - the agent should still be able to read state during
-/// or right after a cancellation.
-private func markObservation() {
-  AutomationSession.shared.markActive(narration: nil)
-}
-
 // MARK: - Tool Protocol
 
 /// Every tool conforms to this. The C-ABI invoke layer routes by `name`.
@@ -117,6 +97,8 @@ private struct OpenApplicationTool: Tool {
     let identifier: String
     let observe: Bool?
     let maxElements: Int?
+    let mode: String?
+    let background: Bool?
     let narration: String?
   }
 
@@ -125,26 +107,46 @@ private struct OpenApplicationTool: Tool {
     let bundleId: String?
     let name: String
     let snapshot: TraversalResult?
+    let som: SOMResult?
   }
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'identifier' field") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration ?? "Opening \(input.identifier)...") {
-        return bail
-      }
+      let background = input.background ?? true
       let opened: Swift.Result<AppInfo, AppError> = runAsyncOnMain {
-        await openApplication(identifier: input.identifier)
+        await openApplication(identifier: input.identifier, background: background)
       }
       switch opened {
       case .failure(let error):
         return jsonError(error.message)
       case .success(let info):
-        let snapshot: TraversalResult? =
-          (input.observe ?? true)
-          ? traverse(pid: info.pid, maxElements: input.maxElements ?? 150)
-          : nil
-        return serializeResult(
-          Result(pid: info.pid, bundleId: info.bundleId, name: info.name, snapshot: snapshot))
+        let mode = CaptureMode.parse(input.mode)
+        let observe = input.observe ?? true
+        if !observe {
+          return serializeResult(
+            Result(
+              pid: info.pid, bundleId: info.bundleId, name: info.name,
+              snapshot: nil, som: nil))
+        }
+
+        switch mode {
+        case .ax:
+          let snapshot = traverse(pid: info.pid, maxElements: input.maxElements ?? 150)
+          return serializeResult(
+            Result(
+              pid: info.pid, bundleId: info.bundleId, name: info.name,
+              snapshot: snapshot, som: nil))
+        case .vision, .som:
+          let som = runOnMain {
+            buildCapture(
+              pid: info.pid, mode: mode,
+              maxElements: input.maxElements ?? 150)
+          }
+          return serializeResult(
+            Result(
+              pid: info.pid, bundleId: info.bundleId, name: info.name,
+              snapshot: nil, som: som))
+        }
       }
     }
   }
@@ -155,10 +157,47 @@ private struct OpenApplicationTool: Tool {
 private struct GetUIElementsTool: Tool {
   let name = "get_ui_elements"
 
+  struct Args: Decodable {
+    let pid: Int32
+    let roles: [String]?
+    let maxDepth: Int?
+    let maxElements: Int?
+    let interactiveOnly: Bool?
+    let focusedWindowOnly: Bool?
+    let mode: String?
+    let windowId: Int?
+  }
+
   func run(args: String) -> String {
-    withArgs(args, expecting: "'pid' field") { (filter: ElementFilter) in
-      markObservation()
-      return serializeResult(runOnMain { AccessibilityManager.shared.traverse(filter: filter) })
+    withArgs(args, expecting: "'pid' field") { (input: Args) in
+      var f = ElementFilter(pid: input.pid)
+      f.roles = input.roles
+      f.maxDepth = input.maxDepth
+      f.maxElements = input.maxElements
+      f.interactiveOnly = input.interactiveOnly
+      f.focusedWindowOnly = input.focusedWindowOnly
+      let filter = f
+      let mode = CaptureMode.parse(input.mode)
+      let pid = input.pid
+      let windowId = input.windowId
+      let maxElements = input.maxElements
+      let focusedOnly = input.focusedWindowOnly ?? false
+
+      switch mode {
+      case .ax:
+        let snapshot = runOnMain {
+          AccessibilityManager.shared.traverse(filter: filter)
+        }
+        return serializeResult(snapshot)
+      case .vision, .som:
+        let som = runOnMain {
+          buildCapture(
+            pid: pid, mode: mode, windowId: windowId,
+            maxElements: maxElements,
+            focusedWindowOnly: focusedOnly)
+        }
+        return serializeResult(som)
+      }
     }
   }
 }
@@ -182,7 +221,6 @@ private struct FindElementsTool: Tool {
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'pid' field") { (input: Args) in
-      markObservation()
       let limit = input.limit ?? 10
       let roles = input.roles ?? input.role.map { [$0] }
 
@@ -211,11 +249,36 @@ private struct GetActiveWindowTool: Tool {
   let name = "get_active_window"
 
   func run(args: String) -> String {
-    markObservation()
     if let info = runOnMain({ getActiveWindow() }) {
       return serializeResult(info)
     }
     return jsonError("No active window found")
+  }
+}
+
+// MARK: - List Apps Tool
+
+private struct ListAppsTool: Tool {
+  let name = "list_apps"
+
+  func run(args: String) -> String {
+    return serializeResult(runOnMain { listRunningApps() })
+  }
+}
+
+// MARK: - List Windows Tool
+
+private struct ListWindowsTool: Tool {
+  let name = "list_windows"
+
+  struct Args: Decodable {
+    let pid: Int32
+  }
+
+  func run(args: String) -> String {
+    withArgs(args, expecting: "'pid' field") { (input: Args) in
+      return serializeResult(runOnMain { listWindowsForPid(input.pid) })
+    }
   }
 }
 
@@ -229,12 +292,12 @@ private struct ClickTool: Tool {
     let y: Double
     let button: String?
     let doubleClick: Bool?
+    let pid: Int32?
     let narration: String?
   }
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'x' and 'y' fields") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
       let point = CGPoint(x: input.x, y: input.y)
       let button: MouseButton =
         switch input.button?.lowercased() {
@@ -242,11 +305,22 @@ private struct ClickTool: Tool {
         case "center", "middle": .center
         default: .left
         }
-      let result: InputResult =
-        (input.doubleClick == true)
-        ? MouseController.shared.doubleClick(at: point, button: button)
-        : MouseController.shared.click(at: point, button: button)
-      return serializeResult(result)
+      // pid-targeted: backgrounded path, no cursor warp.
+      // No pid: HID tap (preserves "click at coords on the user's screen"
+      // semantics for the rare canvas/legacy use case).
+      if let pid = input.pid {
+        let result: InputResult =
+          (input.doubleClick == true)
+          ? BackgroundDriver.shared.doubleClick(pid: pid, point: point, button: button)
+          : BackgroundDriver.shared.click(pid: pid, point: point, button: button)
+        return serializeResult(result)
+      } else {
+        let result: InputResult =
+          (input.doubleClick == true)
+          ? MouseController.shared.doubleClick(at: point, button: button)
+          : MouseController.shared.click(at: point, button: button)
+        return serializeResult(result)
+      }
     }
   }
 }
@@ -265,7 +339,6 @@ private struct ClickElementTool: Tool {
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'id' field (string, e.g. 's1-5')") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
       let result: ElementActionResult
       if input.button?.lowercased() == "right" {
         result = ElementInteraction.shared.rightClickElement(id: input.id)
@@ -287,13 +360,18 @@ private struct TypeTextTool: Tool {
   struct Args: Decodable {
     let text: String
     let id: String?
+    let pid: Int32?
     let replace: Bool?
     let narration: String?
   }
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'text' field") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
+      // Resolve target pid: explicit > derived from element id > most recent.
+      let resolvedPid: Int32? =
+        input.pid
+        ?? input.id.flatMap { AccessibilityManager.shared.pid(for: $0) }
+        ?? AccessibilityManager.shared.mostRecentPid()
 
       if let elementId = input.id {
         let focusResult = ElementInteraction.shared.focusElement(id: elementId)
@@ -302,20 +380,20 @@ private struct TypeTextTool: Tool {
         }
         if input.replace ?? true {
           // Best-effort clear; some fields aren't AX-clearable, in which case
-          // typing simply appends. Skip the explicit error path on stale/removed/cancelled.
+          // typing simply appends.
           _ = ElementInteraction.shared.clearElement(id: elementId)
         }
       }
 
-      let result = KeyboardController.shared.type(text: input.text)
-      if result.success {
-        let pid = input.id.flatMap { AccessibilityManager.shared.pid(for: $0) }
-        let delta = pid.flatMap { computeFocusDelta(pid: $0) }
-        return serializeResult(ElementActionResult.ok(delta: delta))
+      let result: InputResult
+      if let pid = resolvedPid {
+        result = BackgroundDriver.shared.type(pid: pid, text: input.text)
+      } else {
+        result = KeyboardController.shared.type(text: input.text)
       }
-      // KeyboardController.type returns the cancellation message verbatim.
-      if result.error?.contains("Cancelled by user") == true {
-        return serializeResult(ElementActionResult.cancelled())
+      if result.success {
+        let delta = resolvedPid.flatMap { computeFocusDelta(pid: $0) }
+        return serializeResult(ElementActionResult.ok(delta: delta))
       }
       return serializeResult(ElementActionResult.fail(result.error ?? "Type failed"))
     }
@@ -336,12 +414,16 @@ private struct PressKeyTool: Tool {
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'key' field") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
       let flags = parseModifierFlags(input.modifiers)
-      let result = KeyboardController.shared.pressKey(keyName: input.key, modifiers: flags)
+      let resolvedPid = input.pid ?? AccessibilityManager.shared.mostRecentPid()
+      let result: InputResult
+      if let pid = resolvedPid, let code = keyCode(for: input.key) {
+        result = BackgroundDriver.shared.pressKey(pid: pid, keyCode: code, modifiers: flags)
+      } else {
+        result = KeyboardController.shared.pressKey(keyName: input.key, modifiers: flags)
+      }
       if result.success {
-        let pid = input.pid ?? AccessibilityManager.shared.mostRecentPid()
-        let delta = pid.flatMap { computeFocusDelta(pid: $0) }
+        let delta = resolvedPid.flatMap { computeFocusDelta(pid: $0) }
         return serializeResult(ElementActionResult.ok(delta: delta))
       }
       return serializeResult(ElementActionResult.fail(result.error ?? "Press key failed"))
@@ -359,12 +441,12 @@ private struct ScrollTool: Tool {
     let amount: Int32?
     let x: Double?
     let y: Double?
+    let pid: Int32?
     let narration: String?
   }
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'direction' field") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
       let direction: ScrollDirection
       switch input.direction.lowercased() {
       case "up": direction = .up
@@ -374,11 +456,20 @@ private struct ScrollTool: Tool {
       default:
         return jsonError("Invalid direction: use 'up', 'down', 'left', or 'right'")
       }
-      if let x = input.x, let y = input.y {
-        _ = MouseController.shared.moveTo(CGPoint(x: x, y: y))
+      // When no pid is provided AND coords are given, position the cursor
+      // first via the HID tap so the scroll lands on the right surface —
+      // legacy behavior. When pid is provided, route per-pid (no warp).
+      if let pid = input.pid {
+        let result = BackgroundDriver.shared.scroll(
+          pid: pid, direction: direction, amount: input.amount ?? 3)
+        return serializeResult(result)
+      } else {
+        if let x = input.x, let y = input.y {
+          _ = MouseController.shared.moveTo(CGPoint(x: x, y: y))
+        }
+        let result = MouseController.shared.scroll(direction: direction, amount: input.amount ?? 3)
+        return serializeResult(result)
       }
-      let result = MouseController.shared.scroll(direction: direction, amount: input.amount ?? 3)
-      return serializeResult(result)
     }
   }
 }
@@ -396,7 +487,6 @@ private struct SetValueTool: Tool {
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'id' (string) and 'value' fields") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
       return serializeResult(
         ElementInteraction.shared.setElementValue(id: input.id, value: input.value))
     }
@@ -415,7 +505,6 @@ private struct ClearFieldTool: Tool {
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'id' field (string, e.g. 's1-5')") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
       return serializeResult(ElementInteraction.shared.clearElement(id: input.id))
     }
   }
@@ -431,16 +520,23 @@ private struct DragTool: Tool {
     let startY: Double
     let endX: Double
     let endY: Double
+    let pid: Int32?
     let narration: String?
   }
 
   func run(args: String) -> String {
     withArgs(args, expecting: "'startX', 'startY', 'endX', 'endY' fields") { (input: Args) in
-      if let bail = gateAutomation(narration: input.narration) { return bail }
-      return serializeResult(
-        MouseController.shared.drag(
-          from: CGPoint(x: input.startX, y: input.startY),
-          to: CGPoint(x: input.endX, y: input.endY)))
+      let start = CGPoint(x: input.startX, y: input.startY)
+      let end = CGPoint(x: input.endX, y: input.endY)
+      // Drag is the one input op that genuinely needs the cursor to track,
+      // because most drag-receivers key off the global mouse position. We
+      // route per-pid when we can (saves cross-app interference) but the
+      // HID tap still fires for each step.
+      if let pid = input.pid {
+        return serializeResult(
+          BackgroundDriver.shared.drag(pid: pid, from: start, to: end))
+      }
+      return serializeResult(MouseController.shared.drag(from: start, to: end))
     }
   }
 }
@@ -467,7 +563,6 @@ private struct TakeScreenshotTool: Tool {
     {
       options = parsed
     }
-    markObservation()
     return serializeResult(ScreenshotController.shared.capture(options: options))
   }
 }
@@ -483,6 +578,7 @@ private struct ActAndObserveTool: Tool {
   struct CombinedResult: Encodable {
     let action: ElementActionResult
     let snapshot: TraversalResult?
+    let som: SOMResult?
     let snapshotError: String?
   }
 
@@ -512,12 +608,15 @@ private struct ActAndObserveTool: Tool {
     }
 
     let observeMode = (obj["observe"] as? String) ?? "full"
+    let captureMode = CaptureMode.parse(obj["mode"] as? String)
     let pidFromArgs: Int32? = (obj["pid"] as? Int).map { Int32($0) }
+    let windowIdFromArgs: Int? = obj["windowId"] as? Int
 
     var subArgs = obj
     subArgs.removeValue(forKey: "action")
     subArgs.removeValue(forKey: "observe")
-    subArgs.removeValue(forKey: "pid")
+    subArgs.removeValue(forKey: "mode")
+    subArgs.removeValue(forKey: "windowId")
     let subPayload =
       (try? JSONSerialization.data(withJSONObject: subArgs))
       .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
@@ -534,7 +633,7 @@ private struct ActAndObserveTool: Tool {
 
     if observeMode == "none" {
       return serializeResult(
-        CombinedResult(action: actionResult, snapshot: nil, snapshotError: nil))
+        CombinedResult(action: actionResult, snapshot: nil, som: nil, snapshotError: nil))
     }
 
     let pid: Int32? =
@@ -544,18 +643,31 @@ private struct ActAndObserveTool: Tool {
     guard let pid = pid else {
       return serializeResult(
         CombinedResult(
-          action: actionResult, snapshot: nil,
+          action: actionResult, snapshot: nil, som: nil,
           snapshotError:
             "Cannot observe: no pid available. Pass 'pid' explicitly to act_and_observe."))
     }
 
-    let snapshot = traverse(
-      pid: pid,
-      maxElements: (obj["maxElements"] as? Int) ?? 150,
-      focusedWindowOnly: observeMode == "focused_window"
-    )
-    return serializeResult(
-      CombinedResult(action: actionResult, snapshot: snapshot, snapshotError: nil))
+    let maxElements = (obj["maxElements"] as? Int) ?? 150
+    let focusedOnly = observeMode == "focused_window"
+
+    switch captureMode {
+    case .ax:
+      let snapshot = traverse(
+        pid: pid, maxElements: maxElements, focusedWindowOnly: focusedOnly)
+      return serializeResult(
+        CombinedResult(
+          action: actionResult, snapshot: snapshot, som: nil, snapshotError: nil))
+    case .vision, .som:
+      let som = runOnMain {
+        buildCapture(
+          pid: pid, mode: captureMode, windowId: windowIdFromArgs,
+          maxElements: maxElements, focusedWindowOnly: focusedOnly)
+      }
+      return serializeResult(
+        CombinedResult(
+          action: actionResult, snapshot: nil, som: som, snapshotError: nil))
+    }
   }
 }
 
@@ -646,6 +758,8 @@ private let toolRegistry: [String: Tool] = {
     GetUIElementsTool(),
     FindElementsTool(),
     GetActiveWindowTool(),
+    ListAppsTool(),
+    ListWindowsTool(),
     ClickElementTool(),
     ClickTool(),
     TypeTextTool(),
@@ -711,8 +825,6 @@ nonisolated(unsafe) private var api: osr_plugin_api = {
   }
 
   api.destroy = { ctxPtr in
-    // Tear down any visible HUD / Esc tap before the plugin context goes
-    // away, otherwise a dangling NSPanel and event tap would outlive us.
     AutomationSession.shared.endSession(reason: "plugin destroyed")
     if let ctxPtr = ctxPtr {
       Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()

@@ -4,7 +4,7 @@ import Foundation
 
 // MARK: - MCP ImageContent (used within content array)
 
-struct MCPImageContent: Encodable {
+struct MCPImageContent: Codable, Sendable {
   let type: String  // "image"
   let data: String  // base64-encoded image data
   let mimeType: String  // e.g., "image/jpeg", "image/png"
@@ -62,8 +62,16 @@ struct AnyCodable: Encodable {
 // MARK: - Screenshot Options
 
 struct ScreenshotOptions: Decodable {
-  /// If specified, capture only this window's owner PID
+  /// Capture only this app's window. Without `windowId`, the largest
+  /// on-screen window for that pid is chosen. Works for occluded and
+  /// off-screen-Space windows too — `CGWindowListCreateImage` doesn't
+  /// require the window to be visible.
   var pid: Int32?
+
+  /// Capture this exact `CGWindowID` (returned by `list_windows`). Beats
+  /// the pid heuristic when an app has multiple windows and the agent
+  /// already knows which one it wants.
+  var windowId: CGWindowID?
 
   /// Display index to capture (0 = main display, 1, 2, etc.)
   var displayIndex: Int?
@@ -142,17 +150,17 @@ final class ScreenshotController: @unchecked Sendable {
   func capture(options: ScreenshotOptions = ScreenshotOptions()) -> ScreenshotResult {
     let image: CGImage?
 
-    if let pid = options.pid {
-      // Capture specific window (works across all displays)
+    if let windowId = options.windowId {
+      // Direct window-id capture is the cleanest backgrounded path: it works
+      // even if the window is hidden, occluded, or on a different Space.
+      image = captureWindow(windowId: windowId)
+    } else if let pid = options.pid {
       image = captureWindow(pid: pid)
     } else if options.allDisplays == true {
-      // Capture all displays combined
       image = captureAllDisplays()
     } else if let displayIndex = options.displayIndex {
-      // Capture specific display by index
       image = captureDisplay(at: displayIndex)
     } else {
-      // Capture main display
       image = captureFullScreen()
     }
 
@@ -162,11 +170,20 @@ final class ScreenshotController: @unchecked Sendable {
 
     // Optionally annotate with element IDs before scaling so labels stay legible.
     let annotatedImage: CGImage = {
-      if options.annotate == true, let pid = options.pid {
+      if options.annotate == true {
+        // When the caller passed a windowId, use that to compute the
+        // capture origin; otherwise fall back to the per-pid heuristic.
+        let pidForElements: Int32? =
+          options.pid
+          ?? options.windowId.flatMap { ownerPid(for: $0) }
+        guard let pid = pidForElements else { return cgImage }
         let elements = AccessibilityManager.shared.mostRecentElements(for: pid)
-        if let captureBounds = captureBoundsForPid(pid),
+        let captureOrigin: CGPoint? =
+          options.windowId.flatMap { captureBoundsForWindowId($0)?.origin }
+          ?? captureBoundsForPid(pid)?.origin
+        if let origin = captureOrigin,
           let overlaid = overlayElementIds(
-            on: cgImage, elements: elements, captureOrigin: captureBounds.origin)
+            on: cgImage, elements: elements, captureOrigin: origin)
         {
           return overlaid
         }
@@ -353,6 +370,38 @@ final class ScreenshotController: @unchecked Sendable {
       windowID,
       [.boundsIgnoreFraming, .bestResolution]
     )
+  }
+
+  /// Capture exactly one CGWindow by id. Skips the heuristic that tries to
+  /// pick "the right" window for a pid; the caller already decided.
+  private func captureWindow(windowId: CGWindowID) -> CGImage? {
+    return CGWindowListCreateImage(
+      .null,
+      .optionIncludingWindow,
+      windowId,
+      [.boundsIgnoreFraming, .bestResolution]
+    )
+  }
+
+  /// Owner pid for a CGWindowID. Used to look up the element cache when
+  /// the caller annotates a windowId-only screenshot.
+  fileprivate func ownerPid(for windowId: CGWindowID) -> Int32? {
+    let info = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowId) as? [[CFString: Any]]
+    return info?.first?[kCGWindowOwnerPID] as? Int32
+  }
+
+  /// Bounds of a specific window in screen coordinates. Mirrors
+  /// `captureBoundsForPid` for the windowId-driven path.
+  fileprivate func captureBoundsForWindowId(_ windowId: CGWindowID) -> CGRect? {
+    let info = CGWindowListCopyWindowInfo(.optionIncludingWindow, windowId) as? [[CFString: Any]]
+    guard let entry = info?.first,
+      let bounds = entry[kCGWindowBounds] as? [String: Any],
+      let x = bounds["X"] as? Double,
+      let y = bounds["Y"] as? Double,
+      let w = bounds["Width"] as? Double,
+      let h = bounds["Height"] as? Double
+    else { return nil }
+    return CGRect(x: x, y: y, width: w, height: h)
   }
 
   private func scaleImage(_ image: CGImage, scale: Double) -> CGImage? {

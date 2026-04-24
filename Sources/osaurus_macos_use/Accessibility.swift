@@ -779,8 +779,18 @@ struct AppError: Error, Sendable {
   let message: String
 }
 
-/// Open or activate an application
-func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
+/// Launch (if needed) and prepare an application for backgrounded driving.
+///
+/// The default mode is `background: true` — we never call `activate()`,
+/// never set `config.activates = true`, and never bring the app's window
+/// across Spaces. The user's frontmost app and cursor are untouched.
+///
+/// Pass `background: false` only when the agent genuinely needs the user
+/// to look at the target window (e.g. an interactive demo capture).
+func openApplication(
+  identifier: String,
+  background: Bool = true
+) async -> Result<AppInfo, AppError> {
   let workspace = NSWorkspace.shared
   let runningApps = workspace.runningApplications
   let lowerId = identifier.lowercased()
@@ -788,8 +798,10 @@ func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
   if let app = runningApps.first(where: {
     $0.localizedName?.lowercased() == lowerId || $0.bundleIdentifier?.lowercased() == lowerId
   }) {
-    app.activate()
-    await waitUntilReady(app: app)
+    if !background {
+      app.activate()
+    }
+    await waitUntilReady(app: app, requireFrontmost: !background)
     return .success(
       AppInfo(
         pid: app.processIdentifier,
@@ -799,8 +811,9 @@ func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
   }
 
   do {
-    let app = try await launchApplication(identifier: identifier, workspace: workspace)
-    await waitUntilReady(app: app, isNewLaunch: true)
+    let app = try await launchApplication(
+      identifier: identifier, workspace: workspace, background: background)
+    await waitUntilReady(app: app, isNewLaunch: true, requireFrontmost: !background)
     return .success(
       AppInfo(
         pid: app.processIdentifier,
@@ -813,7 +826,8 @@ func openApplication(identifier: String) async -> Result<AppInfo, AppError> {
 }
 
 private func waitUntilReady(
-  app: NSRunningApplication, isNewLaunch: Bool = false, timeoutSeconds: Double = 5.0
+  app: NSRunningApplication, isNewLaunch: Bool = false,
+  requireFrontmost: Bool = false, timeoutSeconds: Double = 5.0
 ) async {
   let pollInterval: UInt64 = 100_000_000
   let maxAttempts = Int(timeoutSeconds * 10)
@@ -822,29 +836,18 @@ private func waitUntilReady(
   try? await Task.sleep(nanoseconds: initialDelay)
 
   for _ in 0..<maxAttempts {
-    // Allow Esc to abort the wait without burning the whole 5 seconds.
-    if AutomationSession.shared.isCancelled() {
-      return
-    }
+    // In background mode we only need the AX tree to be queryable; the app
+    // can stay hidden, occluded, or behind another Space.
+    let frontmostOK = !requireFrontmost || app.isActive
 
-    let isFrontmost = app.isActive
+    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+    var windowValue: CFTypeRef?
+    let windowResult = AXUIElementCopyAttributeValue(
+      axApp, kAXWindowsAttribute as CFString, &windowValue)
+    let hasWindow =
+      windowResult == .success && (windowValue as? [AXUIElement])?.isEmpty == false
 
-    let hasWindow: Bool
-    if isFrontmost {
-      let axApp = AXUIElementCreateApplication(app.processIdentifier)
-      var windowValue: CFTypeRef?
-      let windowResult = AXUIElementCopyAttributeValue(
-        axApp, kAXWindowsAttribute as CFString, &windowValue)
-      if windowResult == .success, let windows = windowValue as? [AXUIElement], !windows.isEmpty {
-        hasWindow = true
-      } else {
-        hasWindow = false
-      }
-    } else {
-      hasWindow = false
-    }
-
-    if isFrontmost && hasWindow {
+    if frontmostOK && hasWindow {
       try? await Task.sleep(nanoseconds: 200_000_000)
       return
     }
@@ -854,10 +857,15 @@ private func waitUntilReady(
 }
 
 private func launchApplication(
-  identifier: String, workspace: NSWorkspace
+  identifier: String, workspace: NSWorkspace, background: Bool
 ) async throws -> NSRunningApplication {
   let config = NSWorkspace.OpenConfiguration()
-  config.activates = true
+  config.activates = !background
+  // Background launches should not pollute the user's recent files menu
+  // or pull the dock's attention. Cooperative; macOS may still ignore
+  // these on certain bundle types.
+  config.addsToRecentItems = !background
+  config.hides = background
 
   if let url = workspace.urlForApplication(withBundleIdentifier: identifier) {
     return try await workspace.openApplication(at: url, configuration: config)
@@ -876,6 +884,145 @@ private func launchApplication(
   }
 
   throw AppError(message: "Application not found: \(identifier)")
+}
+
+// MARK: - Window/App Listing
+//
+// These exist so a planning agent can target a specific app and window
+// without ever bringing it forward. `listApps()` is a snapshot of what's
+// running; `listWindows(pid:)` is per-app and includes the on-screen
+// `windowId` (via `_AXWindowID`, the private but stable AX attribute that
+// CGWindowList also reports), so callers can pass it straight to
+// `take_screenshot` or `click`.
+
+struct AppListing: Encodable, Sendable {
+  let pid: Int32
+  let bundleId: String?
+  let name: String
+  let active: Bool
+  let hidden: Bool
+}
+
+struct WindowListing: Encodable, Sendable {
+  let windowId: Int
+  let title: String?
+  let focused: Bool
+  let minimized: Bool
+  let x: Int
+  let y: Int
+  let w: Int
+  let h: Int
+}
+
+struct AppListResult: Encodable, Sendable {
+  let apps: [AppListing]
+}
+
+struct WindowListResult: Encodable, Sendable {
+  let pid: Int32
+  let app: String
+  let windows: [WindowListing]
+}
+
+func listRunningApps() -> AppListResult {
+  let running = NSWorkspace.shared.runningApplications
+  let apps: [AppListing] = running.compactMap { app in
+    // Only surface "regular" GUI apps. Background-only and UI-element
+    // processes can't be driven through AX anyway.
+    guard app.activationPolicy == .regular else { return nil }
+    return AppListing(
+      pid: app.processIdentifier,
+      bundleId: app.bundleIdentifier,
+      name: app.localizedName ?? app.bundleIdentifier ?? "Unknown",
+      active: app.isActive,
+      hidden: app.isHidden
+    )
+  }
+  return AppListResult(apps: apps.sorted { ($0.name) < ($1.name) })
+}
+
+func listWindowsForPid(_ pid: Int32) -> WindowListResult {
+  let appName = NSRunningApplication(processIdentifier: pid)?.localizedName ?? "Unknown"
+  let app = AXUIElementCreateApplication(pid)
+
+  // Focused window for the `focused: true` flag.
+  var focusedRef: CFTypeRef?
+  AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &focusedRef)
+  let focusedWindow: AXUIElement? = focusedRef.map { $0 as! AXUIElement }
+
+  var windowsRef: CFTypeRef?
+  guard
+    AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+    let axWindows = windowsRef as? [AXUIElement]
+  else {
+    return WindowListResult(pid: pid, app: appName, windows: [])
+  }
+
+  // Map AX windows to CGWindowList entries by title+pid+bounds intersection
+  // so we can return the real CGWindowID, which is what every other tool
+  // (screenshot, focus-without-raise) actually expects.
+  let cgInfo: [[CFString: Any]] =
+    (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+      as? [[CFString: Any]]) ?? []
+  let cgForPid = cgInfo.filter { ($0[kCGWindowOwnerPID] as? Int32) == pid }
+
+  var listings: [WindowListing] = []
+  for (idx, win) in axWindows.enumerated() {
+    var titleRef: CFTypeRef?
+    AXUIElementCopyAttributeValue(win, kAXTitleAttribute as CFString, &titleRef)
+    let title = titleRef as? String
+
+    var posRef: CFTypeRef?
+    var sizeRef: CFTypeRef?
+    AXUIElementCopyAttributeValue(win, kAXPositionAttribute as CFString, &posRef)
+    AXUIElementCopyAttributeValue(win, kAXSizeAttribute as CFString, &sizeRef)
+    var pos = CGPoint.zero
+    var size = CGSize.zero
+    if let p = posRef { AXValueGetValue(p as! AXValue, .cgPoint, &pos) }
+    if let s = sizeRef { AXValueGetValue(s as! AXValue, .cgSize, &size) }
+
+    var minimizedRef: CFTypeRef?
+    AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute as CFString, &minimizedRef)
+    let minimized = (minimizedRef as? Bool) ?? false
+
+    let focused = focusedWindow.map { CFEqual($0, win) } ?? false
+
+    // Try to align with a CGWindowID from the running window list. Fall back
+    // to the AX index + 1 (matches the existing `windowId` semantics in
+    // `WindowSummary` and `find_elements`'s windowId arg) when we can't
+    // find an unambiguous match.
+    let cgID: Int = {
+      if let match = cgForPid.first(where: { entry in
+        guard let bounds = entry[kCGWindowBounds] as? [String: Any],
+          let bx = bounds["X"] as? Double,
+          let by = bounds["Y"] as? Double,
+          let bw = bounds["Width"] as? Double,
+          let bh = bounds["Height"] as? Double
+        else { return false }
+        // Allow a few pixels of slop — AX position can disagree with
+        // CGWindow bounds by the window-server stroke width.
+        return abs(bx - pos.x) < 4 && abs(by - pos.y) < 4
+          && abs(bw - size.width) < 4 && abs(bh - size.height) < 4
+      }), let n = match[kCGWindowNumber] as? Int {
+        return n
+      }
+      return idx + 1
+    }()
+
+    listings.append(
+      WindowListing(
+        windowId: cgID,
+        title: title,
+        focused: focused,
+        minimized: minimized,
+        x: Int(pos.x),
+        y: Int(pos.y),
+        w: Int(size.width),
+        h: Int(size.height)
+      ))
+  }
+
+  return WindowListResult(pid: pid, app: appName, windows: listings)
 }
 
 // MARK: - Active Window Info

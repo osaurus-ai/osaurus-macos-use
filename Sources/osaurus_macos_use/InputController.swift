@@ -31,25 +31,19 @@ enum ScrollDirection {
   case right
 }
 
-/// Shared event source used for all synthesized input. Has a small
-/// `localEventsSuppressionInterval` so an involuntary trackpad bump or stray
-/// keystroke is dropped during synthesized events. The "real" defense against
-/// user input is the visible HUD + Esc cancellation, this is just a safety net.
+/// Shared event source used for the HID-tap fallback path.
+///
+/// Backgrounded routes (SkyLight / `CGEvent.postToPid`) live in
+/// [BackgroundDriver](BackgroundDriver.swift) and own their own source.
+/// This one only matters for the explicit `click({x, y})` last-resort tool
+/// and any caller that asks for a global cursor warp.
 private enum SharedEventSource {
-  static let defaultSuppressionInterval: TimeInterval = 0.05
-
   // CGEventSource is a CoreFoundation class without Sendable conformance.
-  // Mutation is single-threaded in practice (only adjusted by KeyboardController.type
-  // around long pastes); we mark it nonisolated(unsafe) and accept the trade.
+  // Mutation is single-threaded in practice; we mark it nonisolated(unsafe)
+  // and accept the trade.
   nonisolated(unsafe) static let source: CGEventSource = {
-    let src = CGEventSource(stateID: .hidSystemState) ?? CGEventSource(stateID: .privateState)!
-    src.localEventsSuppressionInterval = defaultSuppressionInterval
-    return src
+    return CGEventSource(stateID: .hidSystemState) ?? CGEventSource(stateID: .privateState)!
   }()
-
-  static func setSuppression(_ interval: TimeInterval) {
-    source.localEventsSuppressionInterval = interval
-  }
 }
 
 /// Simulates mouse input using CGEvent
@@ -270,32 +264,13 @@ final class MouseController: @unchecked Sendable {
 final class KeyboardController: @unchecked Sendable {
   static let shared = KeyboardController()
 
-  /// Strings longer than this trigger the "loose suppression" path so the user
-  /// isn't locked out of their keyboard for the duration of a long paste.
-  private static let longTypeThreshold: Int = 100
-
   private init() {}
 
-  /// Type a string of text. Long strings (>100 chars) temporarily disable the
-  /// shared event source's input suppression so the user isn't frozen for the
-  /// entire paste duration; Esc-cancellation still works via the per-character
-  /// check below.
+  /// Type a string of text via the HID tap. Used by the no-`pid` branch of
+  /// the `type_text` tool; pid-targeted typing goes through
+  /// [BackgroundDriver.type](BackgroundDriver.swift) which never warps focus.
   func type(text: String) -> InputResult {
-    let isLong = text.count > Self.longTypeThreshold
-    let originalSuppression = SharedEventSource.source.localEventsSuppressionInterval
-    if isLong {
-      SharedEventSource.setSuppression(0.0)
-    }
-    defer {
-      if isLong {
-        SharedEventSource.setSuppression(originalSuppression)
-      }
-    }
-
     for char in text {
-      if AutomationSession.shared.isCancelled() {
-        return .fail("Cancelled by user (Esc was pressed).")
-      }
       if let result = typeCharacter(char), !result.success {
         return result
       }
@@ -327,9 +302,10 @@ final class KeyboardController: @unchecked Sendable {
     return nil
   }
 
-  /// Press a specific key with optional modifiers
+  /// Press a specific key with optional modifiers via the HID tap.
+  /// Use `BackgroundDriver.pressKey(pid:keyCode:)` for pid-targeted presses.
   func pressKey(keyName: String, modifiers: CGEventFlags = []) -> InputResult {
-    guard let keyCode = keyCodeForName(keyName) else {
+    guard let keyCode = keyCode(for: keyName) else {
       return .fail("Unknown key: \(keyName)")
     }
 
@@ -350,83 +326,75 @@ final class KeyboardController: @unchecked Sendable {
 
     return .ok()
   }
+}
 
-  /// Map key names to virtual key codes
-  private func keyCodeForName(_ name: String) -> CGKeyCode? {
-    let lowerName = name.lowercased()
+// MARK: - Key Name Resolution
+//
+// File-private helpers were promoted to internal so BackgroundDriver and
+// ElementInteraction can share the same key-name vocabulary without each
+// re-declaring it.
 
-    let specialKeys: [String: CGKeyCode] = [
-      "return": 0x24,
-      "enter": 0x24,
-      "tab": 0x30,
-      "space": 0x31,
-      "delete": 0x33,
-      "backspace": 0x33,
-      "escape": 0x35,
-      "esc": 0x35,
-      "command": 0x37,
-      "cmd": 0x37,
-      "shift": 0x38,
-      "capslock": 0x39,
-      "option": 0x3A,
-      "alt": 0x3A,
-      "control": 0x3B,
-      "ctrl": 0x3B,
-      "rightshift": 0x3C,
-      "rightoption": 0x3D,
-      "rightcontrol": 0x3E,
-      "function": 0x3F,
-      "fn": 0x3F,
-      "f1": 0x7A,
-      "f2": 0x78,
-      "f3": 0x63,
-      "f4": 0x76,
-      "f5": 0x60,
-      "f6": 0x61,
-      "f7": 0x62,
-      "f8": 0x64,
-      "f9": 0x65,
-      "f10": 0x6D,
-      "f11": 0x67,
-      "f12": 0x6F,
-      "home": 0x73,
-      "end": 0x77,
-      "pageup": 0x74,
-      "pagedown": 0x79,
-      "arrowleft": 0x7B,
-      "left": 0x7B,
-      "arrowright": 0x7C,
-      "right": 0x7C,
-      "arrowdown": 0x7D,
-      "down": 0x7D,
-      "arrowup": 0x7E,
-      "up": 0x7E,
-      "forwarddelete": 0x75,
-    ]
+/// Map a human-readable key name (or single character) to its `CGKeyCode`.
+/// Returns `nil` for names we don't recognize.
+func keyCode(for name: String) -> CGKeyCode? {
+  let lowerName = name.lowercased()
 
-    if let code = specialKeys[lowerName] {
-      return code
-    }
+  let specialKeys: [String: CGKeyCode] = [
+    "return": 0x24,
+    "enter": 0x24,
+    "tab": 0x30,
+    "space": 0x31,
+    "delete": 0x33,
+    "backspace": 0x33,
+    "escape": 0x35,
+    "esc": 0x35,
+    "command": 0x37,
+    "cmd": 0x37,
+    "shift": 0x38,
+    "capslock": 0x39,
+    "option": 0x3A,
+    "alt": 0x3A,
+    "control": 0x3B,
+    "ctrl": 0x3B,
+    "rightshift": 0x3C,
+    "rightoption": 0x3D,
+    "rightcontrol": 0x3E,
+    "function": 0x3F,
+    "fn": 0x3F,
+    "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76,
+    "f5": 0x60, "f6": 0x61, "f7": 0x62, "f8": 0x64,
+    "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
+    "home": 0x73,
+    "end": 0x77,
+    "pageup": 0x74,
+    "pagedown": 0x79,
+    "arrowleft": 0x7B,
+    "left": 0x7B,
+    "arrowright": 0x7C,
+    "right": 0x7C,
+    "arrowdown": 0x7D,
+    "down": 0x7D,
+    "arrowup": 0x7E,
+    "up": 0x7E,
+    "forwarddelete": 0x75,
+  ]
 
-    let letterKeys: [String: CGKeyCode] = [
-      "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04,
-      "g": 0x05, "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09,
-      "b": 0x0B, "q": 0x0C, "w": 0x0D, "e": 0x0E, "r": 0x0F,
-      "y": 0x10, "t": 0x11, "1": 0x12, "2": 0x13, "3": 0x14,
-      "4": 0x15, "6": 0x16, "5": 0x17, "=": 0x18, "9": 0x19,
-      "7": 0x1A, "-": 0x1B, "8": 0x1C, "0": 0x1D, "]": 0x1E,
-      "o": 0x1F, "u": 0x20, "[": 0x21, "i": 0x22, "p": 0x23,
-      "l": 0x25, "j": 0x26, "'": 0x27, "k": 0x28, ";": 0x29,
-      "\\": 0x2A, ",": 0x2B, "/": 0x2C, "n": 0x2D, "m": 0x2E,
-      ".": 0x2F, "`": 0x32,
-    ]
+  if let code = specialKeys[lowerName] { return code }
 
-    if let code = letterKeys[lowerName] {
-      return code
-    }
+  let letterKeys: [String: CGKeyCode] = [
+    "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04,
+    "g": 0x05, "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09,
+    "b": 0x0B, "q": 0x0C, "w": 0x0D, "e": 0x0E, "r": 0x0F,
+    "y": 0x10, "t": 0x11, "1": 0x12, "2": 0x13, "3": 0x14,
+    "4": 0x15, "6": 0x16, "5": 0x17, "=": 0x18, "9": 0x19,
+    "7": 0x1A, "-": 0x1B, "8": 0x1C, "0": 0x1D, "]": 0x1E,
+    "o": 0x1F, "u": 0x20, "[": 0x21, "i": 0x22, "p": 0x23,
+    "l": 0x25, "j": 0x26, "'": 0x27, "k": 0x28, ";": 0x29,
+    "\\": 0x2A, ",": 0x2B, "/": 0x2C, "n": 0x2D, "m": 0x2E,
+    ".": 0x2F, "`": 0x32,
+  ]
 
-    return nil
-  }
+  return letterKeys[lowerName]
 }
 
 // MARK: - Modifier Flags Parsing

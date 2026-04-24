@@ -73,11 +73,6 @@ private enum ResolveOutcome {
 }
 
 private func resolve(id: String) -> ResolveOutcome {
-  // User-cancellation gate. Checked before lookup so we don't waste an AX
-  // round-trip on an action the user has already aborted.
-  if AutomationSession.shared.isCancelled() {
-    return .failure(.cancelled())
-  }
   switch AccessibilityManager.shared.lookup(id: id) {
   case .found(let element):
     return .ok(element)
@@ -97,12 +92,14 @@ private func resolve(id: String) -> ResolveOutcome {
 final class ElementInteraction: @unchecked Sendable {
   static let shared = ElementInteraction()
 
-  private let mouseController = MouseController.shared
-  private let keyboardController = KeyboardController.shared
+  private let driver = BackgroundDriver.shared
 
   private init() {}
 
-  /// Click an element by ID. Tries AXPress first, falls back to coordinate click.
+  /// Click an element by id. Tries AXPress first (fully backgrounded),
+  /// then a per-pid SkyLight click at the element's center, and finally
+  /// the HID-tap path that warps the cursor (only happens when both
+  /// SkyLight and `CGEvent.postToPid` are unavailable).
   func clickElement(id: String) -> ElementActionResult {
     switch resolve(id: id) {
     case .failure(let err): return err
@@ -114,7 +111,7 @@ final class ElementInteraction: @unchecked Sendable {
         return .removed(id)
       }
       let center = CGPoint(x: frame.midX, y: frame.midY)
-      let result = mouseController.click(at: center)
+      let result = driver.click(pid: element.pid, point: center)
       if result.success {
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
@@ -128,7 +125,7 @@ final class ElementInteraction: @unchecked Sendable {
     case .ok(let element):
       guard let frame = element.getCurrentFrame() else { return .removed(id) }
       let center = CGPoint(x: frame.midX, y: frame.midY)
-      let result = mouseController.doubleClick(at: center)
+      let result = driver.doubleClick(pid: element.pid, point: center)
       if result.success {
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
@@ -157,8 +154,12 @@ final class ElementInteraction: @unchecked Sendable {
       }
       guard let frame = element.getCurrentFrame() else { return .removed(id) }
       let center = CGPoint(x: frame.midX, y: frame.midY)
-      let result = mouseController.click(at: center, button: .right)
+      let result = driver.click(pid: element.pid, point: center, button: .right)
       if result.success {
+        // Heads-up: per the cua background-driver post, Chromium coerces
+        // synthetic right-clicks on web content to left-clicks at the
+        // renderer-IPC boundary. AXShowMenu above is the only reliable
+        // right-click path for those targets.
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
       return .fail(result.error ?? "Right click failed")
@@ -204,11 +205,17 @@ final class ElementInteraction: @unchecked Sendable {
       if result == .success {
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
-      // Fallback: focus, select all, delete
+      // Fallback: focus, select all, delete — routed per-pid so other
+      // apps don't see the Cmd+A.
       let focusResult = focusElement(id: id)
       if !focusResult.success { return focusResult }
-      _ = keyboardController.pressKey(keyName: "a", modifiers: .maskCommand)
-      let del = keyboardController.pressKey(keyName: "delete", modifiers: [])
+      if let aCode = keyCode(for: "a") {
+        _ = driver.pressKey(pid: element.pid, keyCode: aCode, modifiers: .maskCommand)
+      }
+      guard let delCode = keyCode(for: "delete") else {
+        return .fail("Failed to clear field: no delete key code available")
+      }
+      let del = driver.pressKey(pid: element.pid, keyCode: delCode, modifiers: [])
       if del.success {
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
