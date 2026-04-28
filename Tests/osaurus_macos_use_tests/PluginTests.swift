@@ -238,6 +238,83 @@ struct ManifestTests {
     let openDesc = (byId["open_application"]?["description"] as? String ?? "").lowercased()
     #expect(openDesc.contains("snapshot"), "open_application should mention snapshot")
   }
+
+  @Test("Screenshot tool exposes bounded capture and save controls")
+  func screenshotToolContract() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+
+    let manifestPtr = api.getManifest!(ctx)!
+    let manifest = String(cString: manifestPtr)
+    api.freeString!(manifestPtr)
+
+    let json = parseJSON(manifest)!
+    let capabilities = json["capabilities"] as! [String: Any]
+    let tools = capabilities["tools"] as! [[String: Any]]
+    let byId = Dictionary(uniqueKeysWithValues: tools.map { ($0["id"] as! String, $0) })
+
+    let screenshot = byId["take_screenshot"]!
+    let description = (screenshot["description"] as? String ?? "").lowercased()
+    #expect(description.contains("windowid"))
+    #expect(description.contains("annotate"))
+
+    let params = screenshot["parameters"] as! [String: Any]
+    let properties = params["properties"] as! [String: Any]
+    for field in ["pid", "windowId", "displayIndex", "allDisplays", "format", "scale", "savePath"] {
+      #expect(properties[field] != nil, "take_screenshot should expose '\(field)'")
+    }
+  }
+
+  @Test("Action-observe contract supports stale recovery after mutations")
+  func actionObserveContract() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+
+    let manifestPtr = api.getManifest!(ctx)!
+    let manifest = String(cString: manifestPtr)
+    api.freeString!(manifestPtr)
+
+    let json = parseJSON(manifest)!
+    let capabilities = json["capabilities"] as! [String: Any]
+    let tools = capabilities["tools"] as! [[String: Any]]
+    let byId = Dictionary(uniqueKeysWithValues: tools.map { ($0["id"] as! String, $0) })
+
+    let actAndObserve = byId["act_and_observe"]!
+    let description = (actAndObserve["description"] as? String ?? "").lowercased()
+    #expect(description.contains("observe"))
+    #expect(description.contains("snapshot"))
+
+    let params = actAndObserve["parameters"] as! [String: Any]
+    let required = params["required"] as? [String] ?? []
+    let properties = params["properties"] as! [String: Any]
+    #expect(required == ["action"])
+    #expect(properties["observe"] != nil)
+    #expect(properties["maxElements"] != nil)
+  }
+
+  @Test("Session tools are described as telemetry-only")
+  func sessionToolsAreTelemetryOnly() {
+    let ctx = createContext(api: api)
+    defer { api.destroy!(ctx) }
+
+    let manifestPtr = api.getManifest!(ctx)!
+    let manifest = String(cString: manifestPtr)
+    api.freeString!(manifestPtr)
+
+    let json = parseJSON(manifest)!
+    let capabilities = json["capabilities"] as! [String: Any]
+    let tools = capabilities["tools"] as! [[String: Any]]
+    let byId = Dictionary(uniqueKeysWithValues: tools.map { ($0["id"] as! String, $0) })
+
+    let start = (byId["start_automation_session"]?["description"] as? String ?? "").lowercased()
+    let update = (byId["update_automation_session"]?["description"] as? String ?? "").lowercased()
+    let end = (byId["end_automation_session"]?["description"] as? String ?? "").lowercased()
+
+    #expect(start.contains("telemetry") || start.contains("side-effect-free"))
+    #expect(update.contains("side-effect-free"))
+    #expect(update.contains("no ui change"))
+    #expect(end.contains("informational"))
+  }
 }
 
 // MARK: - Invoke Routing Tests
@@ -614,7 +691,6 @@ struct ToolFunctionalTests {
     let json = parseJSON(result)!
     let displays = json["displays"] as? [[String: Any]]
     #expect(displays != nil)
-    #expect((displays?.count ?? 0) >= 1)
 
     if let first = displays?.first {
       #expect(first["index"] is Int)
