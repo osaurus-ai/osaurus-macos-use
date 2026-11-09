@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+AX mutations targeting the plugin's own host now run on the main thread.
+The self-target `type_text` clear step could synchronously enter the host's
+AppKit text editor on the accessibility worker and trap in its main-actor
+undo delegate (APPLE-MACOS-3MR). Other applications' AX requests stay on the
+worker. The editor's scoped undo manager is preserved.
+
 ## 3.0.4 — Fix SkyLight crash on macOS 26.4+
 
 Computer use crashed the host app (`EXC_BAD_ACCESS` inside SkyLight) whenever it typed text or pressed a key into a target on macOS 26.4 and later. The private `SLEventPostToPid` primitive the backgrounded driver relies on changed behavior on 26.4 and now segfaults on the first call (it forwards a garbage event pointer into `SLEventPostToPSN`). On 26.4+ the driver now addresses the target by PSN and posts through `SLEventPostToPSN` directly — the entry point `SLEventPostToPid` itself bottoms out in — so backgrounded input keeps working, Chromium included, with the cursor still never moving. Older macOS is untouched. If the PSN post can't be made, the driver falls back to `CGEvent.postToPid` as before.

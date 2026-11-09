@@ -104,7 +104,9 @@ final class CachedElement: @unchecked Sendable {
   }
 
   func performAction(_ action: String) -> Bool {
-    let result = AXUIElementPerformAction(axElement, action as CFString)
+    let result = performAXMutation(targetPID: pid) {
+      AXUIElementPerformAction(axElement, action as CFString)
+    }
     return result == .success
   }
 }
