@@ -138,8 +138,10 @@ final class ElementInteraction: @unchecked Sendable {
     switch resolve(id: id) {
     case .failure(let err): return err
     case .ok(let element):
-      let result = AXUIElementSetAttributeValue(
-        element.axElement, kAXFocusedAttribute as CFString, true as CFTypeRef)
+      let result = performAXMutation(targetPID: element.pid) {
+        AXUIElementSetAttributeValue(
+          element.axElement, kAXFocusedAttribute as CFString, true as CFTypeRef)
+      }
       if result == .success { return .ok() }
       return clickElement(id: id)
     }
@@ -183,8 +185,10 @@ final class ElementInteraction: @unchecked Sendable {
     switch resolve(id: id) {
     case .failure(let err): return err
     case .ok(let element):
-      let result = AXUIElementSetAttributeValue(
-        element.axElement, kAXValueAttribute as CFString, value as CFTypeRef)
+      let result = performAXMutation(targetPID: element.pid) {
+        AXUIElementSetAttributeValue(
+          element.axElement, kAXValueAttribute as CFString, value as CFTypeRef)
+      }
       if result == .success {
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
@@ -200,8 +204,10 @@ final class ElementInteraction: @unchecked Sendable {
     switch resolve(id: id) {
     case .failure(let err): return err
     case .ok(let element):
-      let result = AXUIElementSetAttributeValue(
-        element.axElement, kAXValueAttribute as CFString, "" as CFTypeRef)
+      let result = performAXMutation(targetPID: element.pid) {
+        AXUIElementSetAttributeValue(
+          element.axElement, kAXValueAttribute as CFString, "" as CFTypeRef)
+      }
       if result == .success {
         return .ok(delta: computeFocusDelta(pid: element.pid))
       }
